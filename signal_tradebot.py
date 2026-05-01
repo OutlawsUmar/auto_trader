@@ -1,8 +1,8 @@
 import ccxt
 import pandas as pd
-import ta
 from telegram import Bot
 import time
+
 from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
@@ -11,17 +11,17 @@ from ta.volatility import AverageTrueRange
 API_TOKEN = "8764116821:AAEPAwJq5hy3bAUD7VSdgz7juwfz2i2_kD4"
 CHAT_ID = "-1003978043796"
 
-symbol = "SOL/USDT"
+symbols = ["SOL/USDT", "BTC/USDT", "ETH/USDT", "BNB/USDT", "LTC/USDT", "XRP/USDT", "ADA/USDT", "DOGE/USDT", "AVAX/USDT", "LINK/USDT", "DOT/USDT"]
 timeframe = "15m"
-limit = 200
+limit = 250
 
 bot = Bot(token=API_TOKEN)
 exchange = ccxt.binance()
 
-last_signal = None  # 👈 для убирания дублей
+last_signal = {}  # 👈 для убирания дублей 
 
 # ================= DATA =================
-def get_data():
+def get_data(symbol):
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["time","open","high","low","close","volume"])
     return df
@@ -103,9 +103,9 @@ def calculate_levels(price, atr, signal):
     return stop, tp
 
 # ================= SEND =================
-def send_signal(signal, price, stop, tp, reasons):
+def send_signal(symbol, signal, price, stop, tp, reasons):
     message = f"""
-📊 SIGNAL: {signal}
+📊 {symbol} SIGNAL: {signal}
 Price: {price:.2f}
 
 🛑 Stop: {stop:.2f}
@@ -120,29 +120,29 @@ Price: {price:.2f}
 def run():
     global last_signal
 
-    df = get_data()
-    df = add_indicators(df)
+    for symbol in symbols:
+        df = get_data(symbol)
+        df = add_indicators(df)
 
-    signal, reasons, last = analyze(df)
+        signal, reasons, last = analyze(df)
 
-    if signal:
-        # 👇 убираем дубли
-        if signal != last_signal:
-            price = last["close"]
-            stop, tp = calculate_levels(price, last["atr"], signal)
+        if signal:
+            if last_signal.get(symbol) != signal:
+                price = last["close"]
+                stop, tp = calculate_levels(price, last["atr"], signal)
 
-            send_signal(signal, price, stop, tp, reasons)
-            print("Signal sent:", signal)
+                send_signal(symbol, signal, price, stop, tp, reasons)
+                print(f"Signal sent: {symbol} {signal}")
 
-            last_signal = signal
-    else:
-        print("No signal")
+                last_signal[symbol] = signal
+        else:
+            print(f"No signal: {symbol}")
 
 # ================= LOOP =================
 while True:
     try:
         run()
-        time.sleep(300)  # 15 минут
+        time.sleep(900)  # 15 минут
     except Exception as e:
         print("Error:", e)
         time.sleep(60)
