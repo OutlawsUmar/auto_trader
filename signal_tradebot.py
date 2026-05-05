@@ -45,7 +45,7 @@ def add_indicators(df):
 
 # ================= LOGIC =================
 def analyze(df):
-    last = df.iloc[-1]
+    last = df.iloc[-2]
 
     signal = None
     reason = []
@@ -80,11 +80,28 @@ def analyze(df):
     if last["atr"] < df["atr"].mean():
         reason.append("Low volatility")
 
+    if last["close"] > last["ema50"]:
+        reason.append("Above EMA50")
+
     # ===== ENTRY LOGIC =====
-    if trend == "UP" and last["rsi"] < 40 and last["macd"] > last["macd_signal"]:
+    if (
+        trend == "UP"
+        and last["rsi"] < 45
+        and last["macd"] > last["macd_signal"]
+        and last["close"] > last["ema50"]
+        and last["atr"] > df["atr"].mean()
+        and last["close"] > last["open"]
+    ):
         signal = "BUY"
 
-    elif trend == "DOWN" and last["rsi"] > 60 and last["macd"] < last["macd_signal"]:
+    elif (
+        trend == "DOWN"
+        and last["rsi"] > 55
+        and last["macd"] < last["macd_signal"]
+        and last["close"] < last["ema50"]
+        and last["atr"] > df["atr"].mean()
+        and last["close"] < last["open"]
+    ):
         signal = "SELL"
 
     return signal, reason, last
