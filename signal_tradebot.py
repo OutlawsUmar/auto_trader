@@ -11,7 +11,9 @@ from ta.volatility import AverageTrueRange
 API_TOKEN = "8764116821:AAEPAwJq5hy3bAUD7VSdgz7juwfz2i2_kD4"
 CHAT_ID = "-1003978043796"
 
-symbols = ["SOL/USDT", "BTC/USDT", "ETH/USDT", "BNB/USDT", "LTC/USDT", "XRP/USDT", "ADA/USDT", "DOGE/USDT", "AVAX/USDT", "LINK/USDT", "DOT/USDT"]
+symbols = ["SOL/USDT", "BTC/USDT", "ETH/USDT", "BNB/USDT", "LTC/USDT", 
+           "XRP/USDT", "ADA/USDT", "DOGE/USDT", "AVAX/USDT", "LINK/USDT",
+            "DOT/USDT", "ARB/USDT","OP/USDT","SUI/USDT","TON/USDT","NEAR/USDT"]
 timeframe = "15m"
 limit = 250
 
@@ -89,7 +91,7 @@ def analyze(df):
         and last["rsi"] < 45
         and last["macd"] > last["macd_signal"]
         and last["close"] > last["ema50"]
-        and last["atr"] > df["atr"].mean()
+        # atr removed test
         and last["close"] > last["open"]
     ):
         signal = "BUY"
@@ -99,7 +101,7 @@ def analyze(df):
         and last["rsi"] > 55
         and last["macd"] < last["macd_signal"]
         and last["close"] < last["ema50"]
-        and last["atr"] > df["atr"].mean()
+        # atr removed test
         and last["close"] < last["open"]
     ):
         signal = "SELL"
