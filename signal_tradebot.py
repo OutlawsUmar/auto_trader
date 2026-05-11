@@ -2,6 +2,7 @@ import ccxt
 import pandas as pd
 from telegram import Bot
 import time
+import datetime
 
 from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
@@ -12,8 +13,8 @@ API_TOKEN = "8764116821:AAEPAwJq5hy3bAUD7VSdgz7juwfz2i2_kD4"
 CHAT_ID = "-1003978043796"
 
 symbols = ["SOL/USDT", "BTC/USDT", "ETH/USDT", "BNB/USDT", "LTC/USDT", 
-           "XRP/USDT", "ADA/USDT", "DOGE/USDT", "AVAX/USDT", "LINK/USDT",
-            "DOT/USDT", "ARB/USDT","OP/USDT","SUI/USDT","TON/USDT","NEAR/USDT"]
+           "XRP/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT", "DOT/USDT",
+            "ARB/USDT","OP/USDT","SUI/USDT","TON/USDT","NEAR/USDT"]
 timeframe = "15m"
 limit = 250
 
@@ -61,9 +62,9 @@ def analyze(df, symbol):
         trend = "SIDEWAYS"
 
     # 2. RSI
-    if last["rsi"] < 40:
+    if last["rsi"] < 45:
         reason.append("RSI oversold")
-    if last["rsi"] > 60:
+    if last["rsi"] > 55:
         reason.append("RSI overbought")
 
     # 3. MACD
@@ -126,10 +127,10 @@ def calculate_levels(price, atr, signal):
 def send_signal(symbol, signal, price, stop, tp, reasons):
     message = f"""
 📊 {symbol} SIGNAL: {signal}
-Price: {price:.2f}
+Price: {price:.4f}
 
-🛑 Stop: {stop:.2f}
-🎯 TP: {tp:.2f}
+🛑 Stop: {stop:.4f}
+🎯 TP: {tp:.4f}
 
 📌 Reasons:
 {", ".join(reasons)}
@@ -161,8 +162,21 @@ def run():
 # ================= LOOP =================
 while True:
     try:
-        run()
-        time.sleep(900)  # 15 минут
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        # Ждем нужные минуты: 01, 16, 31, 46
+        if now.minute in [1, 16, 31, 46]:
+            print(f"\n=== RUNNING ANALYSIS {now} ===")
+
+            run()
+
+            # защита от повторного запуска в ту же минуту
+            time.sleep(60)
+
+        else:
+            # проверяем время каждые 5 секунд
+            time.sleep(5)
+
     except Exception as e:
         print("Error:", e)
         time.sleep(60)
