@@ -13,9 +13,9 @@ API_TOKEN = "8764116821:AAEPAwJq5hy3bAUD7VSdgz7juwfz2i2_kD4"
 CHAT_ID = "-1003978043796"
 
 symbols = [
-    "BTC/USDT", "SOL/USDT", "ETH/USDT", "BNB/USDT", "XRP/USDT",
-    "AVAX/USDT", "LINK/USDT", "SUI/USDT", "NEAR/USDT"
-]
+    "SOL/USDT", "BNB/USDT", "XRP/USDT", "AVAX/USDT", "LINK/USDT",
+    "SUI/USDT", "NEAR/USDT", "INJ/USDT", "BTC/USDT"
+]   
 
 timeframe = "15m"
 limit = 220
@@ -124,8 +124,8 @@ def strategy_breakout_compression(df, last):
     if len(df) < 30:
         return None
 
-    recent = df.iloc[-12:-2]  # последние закрытые свечи до текущей закрытой
-    if len(recent) < 8:
+    recent = df.iloc[-10:-2]  # последние закрытые свечи до текущей закрытой
+    if len(recent) < 6:
         return None
 
     recent_high = recent["high"].max()
@@ -138,9 +138,16 @@ def strategy_breakout_compression(df, last):
     recent_volume = recent["volume"].mean()
     body = abs(last["close"] - last["open"])
 
-    compression = recent_range_pct <= 0.020 and last["atr"] <= recent_atr * 1.05
+    avg_body_pct = (
+    abs(recent["close"] - recent["open"]) / recent["close"]
+    ).mean()
+
+    small_candles = avg_body_pct < 0.003
+
+
+    compression = recent_range_pct <= 0.020 and last["atr"] <= recent_atr * 1.05 and small_candles
     volume_ok = last["volume"] >= recent_volume * 1.05
-    strong_body = body >= last["atr"] * 0.35
+    strong_body = body >= last["atr"] * 0.55
 
     if (
         compression
@@ -191,8 +198,8 @@ def strategy_expansion_volatility(df, last, trend):
     if len(df) < 40:
         return None
 
-    recent = df.iloc[-20:-2]
-    if len(recent) < 10:
+    recent = df.iloc[-9:-2]
+    if len(recent) < 5:
         return None
 
     atr_avg = recent["atr"].mean()
@@ -202,9 +209,19 @@ def strategy_expansion_volatility(df, last, trend):
     candle_range = last["high"] - last["low"]
 
     atr_expanding = last["atr"] > atr_avg * 1.10
-    body_expanding = body >= last["atr"] * 0.55
+    body_expanding = body >= last["atr"] * 0.7
     range_expanding = candle_range >= atr_avg * 1.20
     volume_spike = last["volume"] > vol_avg * 1.10
+
+    close_strength_long = (
+        (last["close"] - last["low"]) /
+        (last["high"] - last["low"])
+    )
+
+    close_strength_short = (
+    (last["high"] - last["close"]) /
+    (last["high"] - last["low"])
+    )   
 
     if (
         trend == "UP"
@@ -214,7 +231,8 @@ def strategy_expansion_volatility(df, last, trend):
         and atr_expanding
         and body_expanding
         and volume_spike
-        and range_expanding
+        and close_strength_long > 0.7
+        
     ):
         reasons = [
             "ATR expanding",
@@ -236,7 +254,8 @@ def strategy_expansion_volatility(df, last, trend):
         and atr_expanding
         and body_expanding
         and volume_spike
-        and range_expanding
+        and close_strength_short > 0.7
+        
     ):
         reasons = [
             "ATR expanding",
