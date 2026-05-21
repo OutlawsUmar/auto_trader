@@ -14,7 +14,7 @@ CHAT_ID = "-1003978043796"
 
 symbols = [
     "SOL/USDT", "BNB/USDT", "XRP/USDT", "AVAX/USDT", "LINK/USDT",
-    "SUI/USDT", "NEAR/USDT", "INJ/USDT", "BTC/USDT"
+    "SUI/USDT", "NEAR/USDT", "INJ/USDT"
 ]   
 
 timeframe = "15m"
@@ -59,6 +59,17 @@ def add_indicators(df):
 
     atr = AverageTrueRange(df["high"], df["low"], df["close"], window=14)
     df["atr"] = atr.average_true_range()
+    
+
+    df["swing_low"] = (
+    (df["low"] < df["low"].shift(1)) &
+    (df["low"] < df["low"].shift(-1))
+    )
+
+    df["swing_high"] = (
+    (df["high"] > df["high"].shift(1)) &
+    (df["high"] > df["high"].shift(-1))
+    )
 
     df = df.dropna()
     return df
@@ -198,8 +209,8 @@ def strategy_expansion_volatility(df, last, trend):
     if len(df) < 40:
         return None
 
-    recent = df.iloc[-9:-2]
-    if len(recent) < 5:
+    recent = df.iloc[-11:-2]
+    if len(recent) < 6:
         return None
 
     atr_avg = recent["atr"].mean()
@@ -280,35 +291,50 @@ def strategy_liquidity_sweep(df, last, trend):
     if len(df) < 30:
         return None
 
-    recent = df.iloc[-12:-2]
-    if len(recent) < 8:
+    recent = df.iloc[-24:-2]
+    if len(recent) < 12:
+        return None
+    
+
+    atr_avg = recent["atr"].mean()
+    swing_lows = recent[recent["swing_low"]]
+    swing_highs = recent[recent["swing_high"]]
+    vol_avg = recent["volume"].mean()
+    
+    if len(swing_lows) == 0 or len(swing_highs) == 0:
         return None
 
-    prev_high = recent["high"].max()
-    prev_low = recent["low"].min()
-    vol_avg = recent["volume"].mean()
+    prev_low = swing_lows["low"].iloc[-1]
+    prev_high = swing_highs["high"].iloc[-1]
 
     body = abs(last["close"] - last["open"])
     upper_wick = last["high"] - max(last["close"], last["open"])
     lower_wick = min(last["close"], last["open"]) - last["low"]
 
+    candle_range = last["high"] - last["low"]
+    strong_candle = candle_range > atr_avg * 0.75
+
+
+    
+
+
     sell_side_sweep = (
         
         last["low"] < prev_low
         and last["close"] > prev_low
-        and last["close"] > last["open"]
         and last["rsi"] < 45
-        and lower_wick > body * 0.8
+        and lower_wick > body * 0.75
         and trend != "DOWN"
+        and strong_candle
     )
 
     buy_side_sweep = (
         last["high"] > prev_high
         and last["close"] < prev_high
-        and last["close"] < last["open"]
         and last["rsi"] > 55
-        and upper_wick > body * 0.8
+        and upper_wick > body * 0.75
         and trend != "UP"
+        and strong_candle
     )
 
     if sell_side_sweep:
