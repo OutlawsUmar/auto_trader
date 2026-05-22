@@ -14,7 +14,7 @@ CHAT_ID = "-1003978043796"
 
 symbols = [
     "SOL/USDT", "BNB/USDT", "XRP/USDT", "AVAX/USDT", "LINK/USDT",
-    "SUI/USDT", "NEAR/USDT", "INJ/USDT"
+    "SUI/USDT", "NEAR/USDT", "INJ/USDT", "BTC/USDT"
 ]   
 
 timeframe = "15m"
@@ -61,14 +61,20 @@ def add_indicators(df):
     df["atr"] = atr.average_true_range()
     
 
+     # ================= SWING LOW =================
     df["swing_low"] = (
-    (df["low"] < df["low"].shift(1)) &
-    (df["low"] < df["low"].shift(-1))
+        (df["low"] < df["low"].shift(1)) &
+        (df["low"] < df["low"].shift(2)) &
+        (df["low"] < df["low"].shift(-1)) &
+        (df["low"] < df["low"].shift(-2))
     )
 
+    # ================= SWING HIGH =================
     df["swing_high"] = (
-    (df["high"] > df["high"].shift(1)) &
-    (df["high"] > df["high"].shift(-1))
+        (df["high"] > df["high"].shift(1)) &
+        (df["high"] > df["high"].shift(2)) &
+        (df["high"] > df["high"].shift(-1)) &
+        (df["high"] > df["high"].shift(-2))
     )
 
     df = df.dropna()
@@ -163,7 +169,7 @@ def strategy_breakout_compression(df, last):
     if (
         compression
         and last["close"] > recent_high
-        and last["close"] > last["ema50"]
+        # and last["close"] > last["ema50"]    testing
         and last["macd"] > last["macd_signal"]
         and last["close"] > last["open"]
     ):
@@ -182,7 +188,7 @@ def strategy_breakout_compression(df, last):
     if (
         compression
         and last["close"] < recent_low
-        and last["close"] < last["ema50"]
+        #  and last["close"] < last["ema50"]     testing
         and last["macd"] < last["macd_signal"]
         and last["close"] < last["open"]
     ):
@@ -209,7 +215,7 @@ def strategy_expansion_volatility(df, last, trend):
     if len(df) < 40:
         return None
 
-    recent = df.iloc[-11:-2]
+    recent = df.iloc[-10:-2]
     if len(recent) < 6:
         return None
 
@@ -235,13 +241,12 @@ def strategy_expansion_volatility(df, last, trend):
     )   
 
     if (
-        trend == "UP"
-        and last["close"] > last["ema50"]
+        atr_expanding
+        #  and trend == "UP"                   testing
+        #  and last["close"] > last["ema50"]   testing
         and last["macd"] > last["macd_signal"]
         and last["close"] > last["open"]
-        and atr_expanding
         and body_expanding
-        and volume_spike
         and close_strength_long > 0.7
         
     ):
@@ -258,13 +263,12 @@ def strategy_expansion_volatility(df, last, trend):
         return make_candidate("EXPANSION", "BUY", 1.0 + (0.2 if volume_spike else 0) + (0.2 if range_expanding else 0), reasons)
 
     if (
-        trend == "DOWN"
-        and last["close"] < last["ema50"]
+        atr_expanding
+        #   and trend == "DOWN"                 testing
+        #   and last["close"] < last["ema50"]   testing
         and last["macd"] < last["macd_signal"]
         and last["close"] < last["open"]
-        and atr_expanding
         and body_expanding
-        and volume_spike
         and close_strength_short > 0.7
         
     ):
@@ -291,8 +295,8 @@ def strategy_liquidity_sweep(df, last, trend):
     if len(df) < 30:
         return None
 
-    recent = df.iloc[-24:-2]
-    if len(recent) < 12:
+    recent = df.iloc[-30:-2]
+    if len(recent) < 24:
         return None
     
 
@@ -307,6 +311,20 @@ def strategy_liquidity_sweep(df, last, trend):
     prev_low = swing_lows["low"].iloc[-1]
     prev_high = swing_highs["high"].iloc[-1]
 
+    tolerance = atr_avg * 0.2
+    
+
+    low_touches = (
+    abs(swing_lows["low"] - prev_low) <= tolerance
+    ).sum()
+
+    high_touches = (
+    abs(swing_highs["high"] - prev_high) <= tolerance
+    ).sum()
+
+    strong_low_level = low_touches >= 2
+    strong_high_level = high_touches >= 2
+
     body = abs(last["close"] - last["open"])
     upper_wick = last["high"] - max(last["close"], last["open"])
     lower_wick = min(last["close"], last["open"]) - last["low"]
@@ -320,21 +338,23 @@ def strategy_liquidity_sweep(df, last, trend):
 
     sell_side_sweep = (
         
-        last["low"] < prev_low
-        and last["close"] > prev_low
-        and last["rsi"] < 45
+        last["low"] < (prev_low - tolerance)
+        and last["close"] > (prev_low - tolerance)
+        # and last["rsi"] < 45       testing
         and lower_wick > body * 0.75
-        and trend != "DOWN"
+        # and trend != "DOWN"        testing 
         and strong_candle
+        and strong_low_level
     )
 
     buy_side_sweep = (
-        last["high"] > prev_high
-        and last["close"] < prev_high
-        and last["rsi"] > 55
+        last["high"] > (prev_high + tolerance)
+        and last["close"] < (prev_high + tolerance)
+        #  and last["rsi"] > 55    testing
         and upper_wick > body * 0.75
-        and trend != "UP"
+        #  and trend != "UP"        testing
         and strong_candle
+        and strong_high_level
     )
 
     if sell_side_sweep:
