@@ -18,7 +18,7 @@ symbols = [
 ]   
 
 timeframe = "15m"
-limit = 220
+limit = 400
 
 bot = Bot(token=API_TOKEN)
 exchange = ccxt.binance({
@@ -169,7 +169,7 @@ def strategy_breakout_compression(df, last):
     if (
         compression
         and last["close"] > recent_high
-        # and last["close"] > last["ema50"]    testing
+        and last["close"] > last["ema50"]    
         and last["macd"] > last["macd_signal"]
         and last["close"] > last["open"]
     ):
@@ -188,7 +188,7 @@ def strategy_breakout_compression(df, last):
     if (
         compression
         and last["close"] < recent_low
-        #  and last["close"] < last["ema50"]     testing
+        and last["close"] < last["ema50"]     
         and last["macd"] < last["macd_signal"]
         and last["close"] < last["open"]
     ):
@@ -243,7 +243,7 @@ def strategy_expansion_volatility(df, last, trend):
     if (
         atr_expanding
         #  and trend == "UP"                   testing
-        #  and last["close"] > last["ema50"]   testing
+        and last["close"] > last["ema50"]   
         and last["macd"] > last["macd_signal"]
         and last["close"] > last["open"]
         and body_expanding
@@ -265,7 +265,7 @@ def strategy_expansion_volatility(df, last, trend):
     if (
         atr_expanding
         #   and trend == "DOWN"                 testing
-        #   and last["close"] < last["ema50"]   testing
+        and last["close"] < last["ema50"]  
         and last["macd"] < last["macd_signal"]
         and last["close"] < last["open"]
         and body_expanding
@@ -384,12 +384,11 @@ def strategy_liquidity_sweep(df, last, trend):
 
 # ================= LOGIC =================
 def analyze(df, symbol):
-    last = df.iloc[-2]  # только закрытая свеча
+    last = df.iloc[-2]
     trend = get_trend(last)
 
     candidates = []
 
-    # Собираем сигналы со всех стилей
     c1 = strategy_trend_pullback(df, last, trend)
     c2 = strategy_breakout_compression(df, last)
     c3 = strategy_expansion_volatility(df, last, trend)
@@ -399,42 +398,7 @@ def analyze(df, symbol):
         if c is not None:
             candidates.append(c)
 
-    if not candidates:
-        return None, [], last, None, 0.0
-
-    buys = [c for c in candidates if c["signal"] == "BUY"]
-    sells = [c for c in candidates if c["signal"] == "SELL"]
-
-    buy_score = sum(c["score"] for c in buys)
-    sell_score = sum(c["score"] for c in sells)
-
-    # Если BUY и SELL почти равны — не лезем в кашу
-    if buys and sells and abs(buy_score - sell_score) < 0.25:
-        return None, [f"Conflict filtered: BUY={buy_score:.1f} vs SELL={sell_score:.1f}"], last, None, 0.0
-
-    # Выбираем сторону с большим суммарным весом
-    if buy_score > sell_score:
-        selected = buys
-        signal = "BUY"
-        total_score = buy_score
-    else:
-        selected = sells
-        signal = "SELL"
-        total_score = sell_score
-
-    # Названия стратегий, которые подтвердили сигнал
-    strategy_name = "+".join(sorted(set(c["strategy"] for c in selected)))
-
-    # Склеиваем причины выбранной стороны
-    reasons = []
-    for c in selected:
-        for r in c["reasons"]:
-            reasons.append(f'[{c["strategy"]}] {r}')
-
-    # Убираем повторы, сохраняя порядок
-    reasons = list(dict.fromkeys(reasons))
-
-    return signal, reasons, last, strategy_name, total_score
+    return candidates, last
 
 
 # ================= RISK =================
@@ -490,10 +454,8 @@ Price: {price:.4f}
 
 # ================= MAIN =================
 def run():
-    global last_signal
-
     for symbol in symbols:
-        time.sleep(2)  # 👈 пауза между запросами к Binance
+        time.sleep(2)
 
         df = get_data(symbol)
 
@@ -503,23 +465,44 @@ def run():
 
         df = add_indicators(df)
 
-        signal, reasons, last, strategy_name, total_score = analyze(df, symbol)
+        candidates, last = analyze(df, symbol)
 
-        if signal:
-            # Оставил старую логику анти-дубля по символу и направлению
-            if last_signal.get(symbol) != signal:
+        if candidates:
+            for c in candidates:
+
+                signal = c["signal"]
+                strategy_name = c["strategy"]
+                total_score = c["score"]
+                reasons = c["reasons"]
+
                 price = last["close"]
-                stop, tp = calculate_levels(price, last["atr"], signal, strategy_name)
 
-                send_signal(symbol, signal, price, stop, tp, reasons, strategy_name, total_score)
-                print(f"Signal sent: {symbol} {signal} | Strategy: {strategy_name} | Score: {total_score:.1f}")
+                stop, tp = calculate_levels(
+                    price,
+                    last["atr"],
+                    signal,
+                    strategy_name
+                )
 
-                last_signal[symbol] = signal
+                send_signal(
+                    symbol,
+                    signal,
+                    price,
+                    stop,
+                    tp,
+                    reasons,
+                    strategy_name,
+                    total_score
+                )
+
+                print(
+                    f"Signal sent: {symbol} "
+                    f"{signal} | {strategy_name} "
+                    f"| Score: {total_score:.1f}"
+                )
+
         else:
-            if reasons and reasons[0].startswith("Conflict filtered"):
-                print(f"{symbol}: {reasons[0]}")
-            else:
-                print(f"No signal: {symbol}")
+            print(f"No signal: {symbol}")
 
 
 # ================= LOOP =================
