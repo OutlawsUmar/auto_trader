@@ -61,23 +61,27 @@ def add_indicators(df):
     df["atr"] = atr.average_true_range()
     
 
-     # ================= SWING LOW =================
+# ================= SWING LOW =================
     df["swing_low"] = (
         (df["low"] < df["low"].shift(1)) &
         (df["low"] < df["low"].shift(2)) &
+        (df["low"] < df["low"].shift(3)) &
         (df["low"] < df["low"].shift(-1)) &
-        (df["low"] < df["low"].shift(-2))
+        (df["low"] < df["low"].shift(-2)) &
+        (df["low"] < df["low"].shift(-3))
     )
 
-    # ================= SWING HIGH =================
+# ================= SWING HIGH =================
     df["swing_high"] = (
         (df["high"] > df["high"].shift(1)) &
         (df["high"] > df["high"].shift(2)) &
+        (df["high"] > df["high"].shift(3)) &
         (df["high"] > df["high"].shift(-1)) &
-        (df["high"] > df["high"].shift(-2))
-    )
+        (df["high"] > df["high"].shift(-2)) &
+        (df["high"] > df["high"].shift(-3))
+)
 
-    df = df.dropna()
+    df = df.dropna().reset_index(drop=True)
     return df
 
 
@@ -101,34 +105,130 @@ def make_candidate(strategy, signal, score, reasons):
 
 # ================= STRATEGY 1: TREND PULLBACK =================
 def strategy_trend_pullback(df, last, trend):
-    # Классический pullback continuation:
-    # тренд уже есть, цена откатила, но momentum еще не сломан.
+
+    if len(df) < 20:
+        return None
+
+    # последние свечи перед сигнальной
+    recent = df.iloc[-6:-1]
+
+    recent_atr = recent["atr"].mean()
+
+    body = abs(last["close"] - last["open"])
+    candle_range = last["high"] - last["low"]
+
+    # защита от division by zero
+    if candle_range == 0:
+        return None
+
+    # ================= MARKET HEALTH =================
+    # фильтр dead market
+
+    avg_range_pct = (
+        (recent["high"] - recent["low"]) / recent["close"]
+    ).mean()
+
+    market_active = avg_range_pct > 0.003
+
+    # ================= CLOSE STRENGTH =================
+
+    close_strength_long = (
+        (last["close"] - last["low"]) /
+        candle_range
+    )
+
+    close_strength_short = (
+        (last["high"] - last["close"]) /
+        candle_range
+    )
+
+    # ================= STRONG BODY =================
+
+    strong_body = body >= last["atr"] * 0.45
+
+    # ================= PULLBACK STRUCTURE =================
+    # хотим увидеть нормальный откат перед continuation
+
+    prev1 = df.iloc[-3]
+    prev2 = df.iloc[-4]
+
+    prev1_body = abs(prev1["close"] - prev1["open"])
+    prev2_body = abs(prev2["close"] - prev2["open"])
+
+    min_pullback_body = recent_atr * 0.30
+
+    # нормальные bearish свечи перед BUY
+    bearish_pullback = (
+        prev1["close"] < prev1["open"]
+        and prev2["close"] < prev2["open"]
+        and prev1_body > min_pullback_body
+        and prev2_body > min_pullback_body
+    )
+
+    # нормальные bullish свечи перед SELL
+    bullish_pullback = (
+        prev1["close"] > prev1["open"]
+        and prev2["close"] > prev2["open"]
+        and prev1_body > min_pullback_body
+        and prev2_body > min_pullback_body
+    )
+
+    # ================= BUY =================
+
     if (
         trend == "UP"
-        and last["rsi"] < 45
         and last["macd"] > last["macd_signal"]
         and last["close"] > last["ema50"] * 0.997
+
+        # market not dead
+        and market_active
+
+        # pullback structure
+        and bearish_pullback
+
+        # continuation confirmation
+        and strong_body
+        and close_strength_long > 0.65
     ):
+
         reasons = [
             "Trend UP",
-            "RSI pullback",
+            "Bearish pullback detected",
             "MACD bullish",
             "Close near/above EMA50",
+            "Strong continuation candle",
+            "Market active",
         ]
+
         return make_candidate("TREND", "BUY", 1.5, reasons)
+
+    # ================= SELL =================
 
     if (
         trend == "DOWN"
-        and last["rsi"] > 55
         and last["macd"] < last["macd_signal"]
         and last["close"] < last["ema50"] * 1.003
+
+        # market not dead
+        and market_active
+
+        # pullback structure
+        and bullish_pullback
+
+        # continuation confirmation
+        and strong_body
+        and close_strength_short > 0.65
     ):
+
         reasons = [
             "Trend DOWN",
-            "RSI pullback",
+            "Bullish pullback detected",
             "MACD bearish",
             "Close near/below EMA50",
+            "Strong continuation candle",
+            "Market active",
         ]
+
         return make_candidate("TREND", "SELL", 1.5, reasons)
 
     return None
@@ -136,12 +236,12 @@ def strategy_trend_pullback(df, last, trend):
 
 # ================= STRATEGY 2: BREAKOUT / COMPRESSION BREAKOUT =================
 def strategy_breakout_compression(df, last):
-    # Идея:
-    # рынок сжимается -> пробивает локальный high/low -> начинается импульс.
+
     if len(df) < 30:
         return None
 
-    recent = df.iloc[-10:-2]  # последние закрытые свечи до текущей закрытой
+    recent = df.iloc[-10:-2]
+
     if len(recent) < 6:
         return None
 
@@ -153,69 +253,115 @@ def strategy_breakout_compression(df, last):
 
     recent_atr = recent["atr"].mean()
     recent_volume = recent["volume"].mean()
+
     body = abs(last["close"] - last["open"])
 
-    avg_body_pct = (
-    abs(recent["close"] - recent["open"]) / recent["close"]
+    # ================= REAL COMPRESSION =================
+
+    avg_candle_range_pct = (
+        (recent["high"] - recent["low"]) / recent["close"]
     ).mean()
 
-    small_candles = avg_body_pct < 0.003
+    tight_ranges = avg_candle_range_pct < 0.003
 
+    compression = (
+        recent_range_pct <= 0.012
+        and last["atr"] <= recent_atr * 1.05
+        and tight_ranges
+    )
 
-    compression = recent_range_pct <= 0.020 and last["atr"] <= recent_atr * 1.05 and small_candles
+    # ================= DEAD MARKET FILTER =================
+    # не убиваем compression,
+    # просто фильтруем totally dead volatility
+
+    atr_pct = recent_atr / last["close"]
+
+    market_alive = atr_pct > 0.0025
+
+    # ================= DIRECTIONAL PRESSURE =================
+
+    bullish_candles = (
+        recent["close"] > recent["open"]
+    ).sum()
+
+    bearish_candles = (
+        recent["close"] < recent["open"]
+    ).sum()
+
+    bullish_pressure = bullish_candles >= 6
+    bearish_pressure = bearish_candles >= 6
+
+    # ================= CONFIRMATIONS =================
+
     volume_ok = last["volume"] >= recent_volume * 1.05
+
     strong_body = body >= last["atr"] * 0.55
+
+    # ================= BUY =================
 
     if (
         compression
+        and market_alive
+        and bullish_pressure
         and last["close"] > recent_high
-        and last["close"] > last["ema50"]    
+        and last["close"] > last["ema50"]
         and last["macd"] > last["macd_signal"]
         and last["close"] > last["open"]
+        and volume_ok
     ):
+
         reasons = [
             "Compression detected",
+            "Bullish pressure",
             "Break above recent high",
             "Above EMA50",
             "MACD bullish",
+            "High volume",
+            "Market active",
         ]
-        if volume_ok:
-            reasons.append("High volume")
-        if strong_body:
-            reasons.append("Strong candle body")
-        return make_candidate("BREAKOUT", "BUY", 1.0 + (0.2 if volume_ok else 0) + (0.2 if strong_body else 0), reasons)
+
+        return make_candidate("BREAKOUT", "BUY", 1.4, reasons)
+
+    # ================= SELL =================
 
     if (
         compression
+        and market_alive
+        and bearish_pressure
         and last["close"] < recent_low
-        and last["close"] < last["ema50"]     
+        and last["close"] < last["ema50"]
         and last["macd"] < last["macd_signal"]
         and last["close"] < last["open"]
+        and volume_ok
     ):
+
         reasons = [
             "Compression detected",
+            "Bearish pressure",
             "Break below recent low",
             "Below EMA50",
             "MACD bearish",
+            "High volume",
+            "Market active",
         ]
-        if volume_ok:
-            reasons.append("High volume")
-        if strong_body:
-            reasons.append("Strong candle body")
-        return make_candidate("BREAKOUT", "SELL", 1.0 + (0.2 if volume_ok else 0) + (0.2 if strong_body else 0), reasons)
+
+        return make_candidate("BREAKOUT", "SELL", 1.4, reasons)
 
     return None
 
 
 # ================= STRATEGY 3: EXPANSION VOLATILITY =================
 def strategy_expansion_volatility(df, last, trend):
+
     # Идея:
     # ATR начинает расширяться, свечи становятся крупнее,
     # появляется импульс и ускорение движения.
+
     if len(df) < 40:
         return None
 
     recent = df.iloc[-10:-2]
+
     if len(recent) < 6:
         return None
 
@@ -225,86 +371,186 @@ def strategy_expansion_volatility(df, last, trend):
     body = abs(last["close"] - last["open"])
     candle_range = last["high"] - last["low"]
 
-    atr_expanding = last["atr"] > atr_avg * 1.10
-    body_expanding = body >= last["atr"] * 0.7
-    range_expanding = candle_range >= atr_avg * 1.20
-    volume_spike = last["volume"] > vol_avg * 1.10
+    if candle_range <= 0:
+        return None
+
+    # ================= CORE EXPANSION =================
+
+    atr_expanding = (
+        last["atr"] > atr_avg * 1.10
+    )
+
+    body_expanding = (
+        body >= last["atr"] * 0.70
+    )
+
+    range_expanding = (
+        candle_range >= atr_avg * 1.20
+    )
+
+    volume_spike = (
+        last["volume"] > vol_avg * 1.10
+    )
+
+    # ================= CLOSE STRENGTH =================
 
     close_strength_long = (
         (last["close"] - last["low"]) /
-        (last["high"] - last["low"])
+        candle_range
     )
 
     close_strength_short = (
-    (last["high"] - last["close"]) /
-    (last["high"] - last["low"])
-    )   
+        (last["high"] - last["close"]) /
+        candle_range
+    )
+
+    # ================= OVEREXTENSION FILTER =================
+    # не брать если цена уже слишком улетела
+
+    distance_from_ema = (
+        abs(last["close"] - last["ema50"]) /
+        last["close"]
+    )
+
+    not_overextended = (
+        distance_from_ema < 0.025
+    )
+
+    # ================= RECENT MOVE FILTER =================
+    # не брать после huge move
+
+    recent_move_up = (
+        (last["close"] - recent["low"].min()) /
+        last["close"]
+    )
+
+    recent_move_down = (
+        (recent["high"].max() - last["close"]) /
+        last["close"]
+    )
+
+    fresh_long_move = (
+        recent_move_up < 0.04
+    )
+
+    fresh_short_move = (
+        recent_move_down < 0.04
+    )
+
+    # ================= EXPANSION FRESHNESS =================
+    # не брать 5 expansion подряд
+
+    recent_expansion_candles = (
+        (
+            abs(recent["close"] - recent["open"])
+            >= recent["atr"] * 0.70
+        )
+    ).sum()
+
+    fresh_expansion = (
+        recent_expansion_candles <= 2
+    )
+
+    # ================= BUY =================
 
     if (
         atr_expanding
-        #  and trend == "UP"                   testing
-        and last["close"] > last["ema50"]   
+        and last["close"] > last["ema50"]
         and last["macd"] > last["macd_signal"]
         and last["close"] > last["open"]
+
         and body_expanding
         and close_strength_long > 0.7
-        
+        and volume_spike
+        and range_expanding
+
+        # NEW FILTERS
+        and not_overextended
+        and fresh_long_move
+        and fresh_expansion
     ):
+
         reasons = [
             "ATR expanding",
             "Bullish displacement",
+            "Fresh expansion move",
             "Above EMA50",
             "MACD bullish",
         ]
+
         if volume_spike:
             reasons.append("Volume spike")
+
         if range_expanding:
             reasons.append("Range expansion")
-        return make_candidate("EXPANSION", "BUY", 1.0 + (0.2 if volume_spike else 0) + (0.2 if range_expanding else 0), reasons)
+
+        return make_candidate(
+            "EXPANSION",
+            "BUY",
+            1.4,
+            reasons
+        )
+
+    # ================= SELL =================
 
     if (
         atr_expanding
-        #   and trend == "DOWN"                 testing
-        and last["close"] < last["ema50"]  
+        and last["close"] < last["ema50"]
         and last["macd"] < last["macd_signal"]
         and last["close"] < last["open"]
+
         and body_expanding
         and close_strength_short > 0.7
-        
+        and range_expanding
+        and volume_spike
+
+        # NEW FILTERS
+        and not_overextended
+        and fresh_short_move
+        and fresh_expansion
     ):
+
         reasons = [
             "ATR expanding",
             "Bearish displacement",
+            "Fresh expansion move",
             "Below EMA50",
             "MACD bearish",
         ]
+
         if volume_spike:
             reasons.append("Volume spike")
+
         if range_expanding:
             reasons.append("Range expansion")
-        return make_candidate("EXPANSION", "SELL", 1.0 + (0.2 if volume_spike else 0) + (0.2 if range_expanding else 0), reasons)
+
+        return make_candidate(
+            "EXPANSION",
+            "SELL",
+            1.4,
+            reasons
+        )
 
     return None
 
 
 # ================= STRATEGY 4: LIQUIDITY SWEEP / REVERSAL =================
 def strategy_liquidity_sweep(df, last, trend):
-    # Идея:
-    # рынок снимает очевидные стопы за локальным high/low,
-    # потом возвращается обратно — это часто reversal / trap move.
+
     if len(df) < 30:
         return None
 
     recent = df.iloc[-30:-2]
+
     if len(recent) < 24:
         return None
-    
 
     atr_avg = recent["atr"].mean()
+    vol_avg = recent["volume"].mean()
+
     swing_lows = recent[recent["swing_low"]]
     swing_highs = recent[recent["swing_high"]]
-    vol_avg = recent["volume"].mean()
-    
+
     if len(swing_lows) == 0 or len(swing_highs) == 0:
         return None
 
@@ -312,72 +558,163 @@ def strategy_liquidity_sweep(df, last, trend):
     prev_high = swing_highs["high"].iloc[-1]
 
     tolerance = atr_avg * 0.2
-    
+
+    # ================= STRONG LEVELS =================
 
     low_touches = (
-    abs(swing_lows["low"] - prev_low) <= tolerance
+        abs(swing_lows["low"] - prev_low) <= tolerance
     ).sum()
 
     high_touches = (
-    abs(swing_highs["high"] - prev_high) <= tolerance
+        abs(swing_highs["high"] - prev_high) <= tolerance
     ).sum()
 
-    strong_low_level = low_touches >= 2
-    strong_high_level = high_touches >= 2
+    strong_low_level = low_touches >= 3
+    strong_high_level = high_touches >= 3
+
+    # ================= RANGE STRUCTURE =================
+    # настоящий liquidity любит bounded market
+
+    range_size_pct = (
+        (prev_high - prev_low) / last["close"]
+    )
+
+    valid_range = (
+        range_size_pct > 0.006
+        and range_size_pct < 0.04
+    )
+
+    # ================= MARKET ALIVE FILTER =================
+
+    atr_pct = atr_avg / last["close"]
+
+    market_alive = atr_pct > 0.003
+
+    # ================= CANDLE STRUCTURE =================
 
     body = abs(last["close"] - last["open"])
-    upper_wick = last["high"] - max(last["close"], last["open"])
-    lower_wick = min(last["close"], last["open"]) - last["low"]
+
+    upper_wick = (
+        last["high"] - max(last["close"], last["open"])
+    )
+
+    lower_wick = (
+        min(last["close"], last["open"]) - last["low"]
+    )
 
     candle_range = last["high"] - last["low"]
-    strong_candle = candle_range > atr_avg * 0.75
 
+    if candle_range == 0:
+        return None
 
-    
+    # свеча должна быть реально заметной
+    strong_candle = candle_range > atr_avg * 1.0
 
+    # тело не микро
+    strong_body = body >= atr_avg * 0.4
+
+    # close должен реально reclaim/reject делать
+    close_strength_long = (
+        (last["close"] - last["low"]) / candle_range
+    )
+
+    close_strength_short = (
+        (last["high"] - last["close"]) / candle_range
+    )
+
+    # ================= SWEEPS =================
 
     sell_side_sweep = (
-        
+
         last["low"] < (prev_low - tolerance)
-        and last["close"] > (prev_low - tolerance)
-        # and last["rsi"] < 45       testing
-        and lower_wick > body * 0.75
-        # and trend != "DOWN"        testing 
+        and last["close"] > prev_low
+
+        # сильный rejection
+        and lower_wick > body * 1.0
+
+        # свеча живая
         and strong_candle
+        and strong_body
+
+        # close near high
+        and close_strength_long > 0.65
+
+        # level quality
         and strong_low_level
+
+        # market structure
+        and valid_range
+        and market_alive
     )
 
     buy_side_sweep = (
+
         last["high"] > (prev_high + tolerance)
-        and last["close"] < (prev_high + tolerance)
-        #  and last["rsi"] > 55    testing
-        and upper_wick > body * 0.75
-        #  and trend != "UP"        testing
+        and last["close"] < prev_high
+
+        # сильный rejection
+        and upper_wick > body * 1.0
+
+        # свеча живая
         and strong_candle
+        and strong_body
+
+        # close near low
+        and close_strength_short > 0.65
+
+        # level quality
         and strong_high_level
+
+        # market structure
+        and valid_range
+        and market_alive
     )
 
+    # ================= BUY =================
+
     if sell_side_sweep:
+
         reasons = [
             "Sell-side liquidity sweep",
-            "Reclaim above prior low",
-            "Bullish rejection",
-            "RSI exhausted",
+            "Strong support level",
+            "Range structure confirmed",
+            "Bullish reclaim",
+            "Strong rejection candle",
+            "Market active",
         ]
+
         if last["volume"] > vol_avg * 1.05:
             reasons.append("Volume confirmation")
-        return make_candidate("LIQUIDITY", "BUY", 1.0 + (0.2 if last["volume"] > vol_avg * 1.05 else 0), reasons)
+
+        return make_candidate(
+            "LIQUIDITY",
+            "BUY",
+            1.4 + (0.2 if last["volume"] > vol_avg * 1.05 else 0),
+            reasons
+        )
+
+    # ================= SELL =================
 
     if buy_side_sweep:
+
         reasons = [
             "Buy-side liquidity sweep",
-            "Reject below prior high",
+            "Strong resistance level",
+            "Range structure confirmed",
             "Bearish rejection",
-            "RSI exhausted",
+            "Strong rejection candle",
+            "Market active",
         ]
+
         if last["volume"] > vol_avg * 1.05:
             reasons.append("Volume confirmation")
-        return make_candidate("LIQUIDITY", "SELL", 1.0 + (0.2 if last["volume"] > vol_avg * 1.05 else 0), reasons)
+
+        return make_candidate(
+            "LIQUIDITY",
+            "SELL",
+            1.4 + (0.2 if last["volume"] > vol_avg * 1.05 else 0),
+            reasons
+        )
 
     return None
 
