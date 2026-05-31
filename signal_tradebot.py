@@ -61,25 +61,19 @@ def add_indicators(df):
     df["atr"] = atr.average_true_range()
     
 
-# ================= SWING LOW =================
     df["swing_low"] = (
         (df["low"] < df["low"].shift(1)) &
         (df["low"] < df["low"].shift(2)) &
-        (df["low"] < df["low"].shift(3)) &
         (df["low"] < df["low"].shift(-1)) &
-        (df["low"] < df["low"].shift(-2)) &
-        (df["low"] < df["low"].shift(-3))
+        (df["low"] < df["low"].shift(-2))
     )
 
-# ================= SWING HIGH =================
     df["swing_high"] = (
         (df["high"] > df["high"].shift(1)) &
         (df["high"] > df["high"].shift(2)) &
-        (df["high"] > df["high"].shift(3)) &
         (df["high"] > df["high"].shift(-1)) &
-        (df["high"] > df["high"].shift(-2)) &
-        (df["high"] > df["high"].shift(-3))
-)
+        (df["high"] > df["high"].shift(-2))
+    )
 
     df = df.dropna().reset_index(drop=True)
     return df
@@ -173,15 +167,25 @@ def strategy_trend_pullback(df, last, trend):
         and prev2_body > min_pullback_body
     )
 
+    distance_from_ema = (
+    abs(last["close"] - last["ema50"])
+    / last["close"]
+    )
+
+    near_ema = (
+        distance_from_ema < 0.02
+    )
+
     # ================= BUY =================
 
     if (
         trend == "UP"
         and last["macd"] > last["macd_signal"]
-        and last["close"] > last["ema50"] * 0.997
+        and last["close"] > last["ema50"]
 
         # market not dead
         and market_active
+        and near_ema
 
         # pullback structure
         and bearish_pullback
@@ -207,10 +211,11 @@ def strategy_trend_pullback(df, last, trend):
     if (
         trend == "DOWN"
         and last["macd"] < last["macd_signal"]
-        and last["close"] < last["ema50"] * 1.003
+        and last["close"] < last["ema50"]
 
         # market not dead
         and market_active
+        and near_ema
 
         # pullback structure
         and bullish_pullback
@@ -258,11 +263,22 @@ def strategy_breakout_compression(df, last):
 
     # ================= REAL COMPRESSION =================
 
-    avg_candle_range_pct = (
-        (recent["high"] - recent["low"]) / recent["close"]
-    ).mean()
+    candle_ranges_pct = (
+    (recent["high"] - recent["low"]) / recent["close"]
+    )
 
-    tight_ranges = avg_candle_range_pct < 0.003
+
+    tight_ranges = (
+    (candle_ranges_pct < 0.003).sum() >= 7
+    )
+
+    breakout_strength_buy = (
+    (last["close"] - recent_high) / last["close"]
+    )
+
+    breakout_strength_sell = (
+        (recent_low - last["close"]) / last["close"]
+    )
 
     compression = (
         recent_range_pct <= 0.012
@@ -295,7 +311,6 @@ def strategy_breakout_compression(df, last):
 
     volume_ok = last["volume"] >= recent_volume * 1.05
 
-    strong_body = body >= last["atr"] * 0.55
 
     # ================= BUY =================
 
@@ -308,6 +323,7 @@ def strategy_breakout_compression(df, last):
         and last["macd"] > last["macd_signal"]
         and last["close"] > last["open"]
         and volume_ok
+        and breakout_strength_buy > 0.0015
     ):
 
         reasons = [
@@ -333,6 +349,7 @@ def strategy_breakout_compression(df, last):
         and last["macd"] < last["macd_signal"]
         and last["close"] < last["open"]
         and volume_ok
+        and breakout_strength_sell > 0.0015
     ):
 
         reasons = [
@@ -391,6 +408,10 @@ def strategy_expansion_volatility(df, last, trend):
     volume_spike = (
         last["volume"] > vol_avg * 1.10
     )
+    
+    atr_pct = atr_avg / last["close"]
+
+    market_alive = atr_pct > 0.0025
 
     # ================= CLOSE STRENGTH =================
 
@@ -413,7 +434,7 @@ def strategy_expansion_volatility(df, last, trend):
     )
 
     not_overextended = (
-        distance_from_ema < 0.025
+        distance_from_ema < 0.018
     )
 
     # ================= RECENT MOVE FILTER =================
@@ -430,11 +451,11 @@ def strategy_expansion_volatility(df, last, trend):
     )
 
     fresh_long_move = (
-        recent_move_up < 0.04
+        recent_move_up < 0.028
     )
 
     fresh_short_move = (
-        recent_move_down < 0.04
+        recent_move_down < 0.028
     )
 
     # ================= EXPANSION FRESHNESS =================
@@ -450,6 +471,14 @@ def strategy_expansion_volatility(df, last, trend):
     fresh_expansion = (
         recent_expansion_candles <= 2
     )
+
+    prev1 = df.iloc[-2]
+
+    prev1_expansion = (
+        abs(prev1["close"] - prev1["open"])
+        >= prev1["atr"] * 0.70
+    )
+
 
     # ================= BUY =================
 
@@ -468,6 +497,8 @@ def strategy_expansion_volatility(df, last, trend):
         and not_overextended
         and fresh_long_move
         and fresh_expansion
+        and market_alive
+        and not prev1_expansion
     ):
 
         reasons = [
@@ -508,6 +539,8 @@ def strategy_expansion_volatility(df, last, trend):
         and not_overextended
         and fresh_short_move
         and fresh_expansion
+        and market_alive
+        and not prev1_expansion
     ):
 
         reasons = [
@@ -569,8 +602,8 @@ def strategy_liquidity_sweep(df, last, trend):
         abs(swing_highs["high"] - prev_high) <= tolerance
     ).sum()
 
-    strong_low_level = low_touches >= 3
-    strong_high_level = high_touches >= 3
+    strong_low_level = low_touches >= 2
+    strong_high_level = high_touches >= 2
 
     # ================= RANGE STRUCTURE =================
     # настоящий liquidity любит bounded market
@@ -630,7 +663,7 @@ def strategy_liquidity_sweep(df, last, trend):
         and last["close"] > prev_low
 
         # сильный rejection
-        and lower_wick > body * 1.0
+        and lower_wick > body * 1.5
 
         # свеча живая
         and strong_candle
@@ -653,7 +686,7 @@ def strategy_liquidity_sweep(df, last, trend):
         and last["close"] < prev_high
 
         # сильный rejection
-        and upper_wick > body * 1.0
+        and upper_wick > body * 1.5
 
         # свеча живая
         and strong_candle
@@ -738,26 +771,43 @@ def analyze(df, symbol):
     return candidates, last
 
 
+def get_entry_price(price, atr, signal, strategy_name):
+
+    if "TREND" in strategy_name:
+
+        if signal == "BUY":
+            return price - atr * 0.2
+        else:
+            return price + atr * 0.2
+
+    elif "LIQUIDITY" in strategy_name:
+
+        if signal == "BUY":
+            return price - atr * 0.3
+        else:
+            return price + atr * 0.3
+
+    return price
+
 # ================= RISK =================
 def calculate_levels(price, atr, signal, strategy_name):
     # Базовые ATR-множители можно потом подстроить под каждую стратегию отдельно.
     name = (strategy_name or "").upper()
 
     if "LIQUIDITY" in name:
-        stop_mult = 1.8
-        tp_mult = 3.6
-    elif "BREAKOUT" in name and "EXPANSION" in name:
-        stop_mult = 2.0
-        tp_mult = 5.0
-    elif "BREAKOUT" in name:
-        stop_mult = 1.8
-        tp_mult = 4.5
-    elif "EXPANSION" in name:
-        stop_mult = 2.0
-        tp_mult = 5.0
-    else:
-        stop_mult = 2.0
+        stop_mult = 1.0
         tp_mult = 4.0
+
+    elif "BREAKOUT" in name:
+        stop_mult = 1.5
+        tp_mult = 4.5
+
+    elif "EXPANSION" in name:
+        stop_mult = 1.5
+        tp_mult = 6.0
+    else:
+        stop_mult = 1.0
+        tp_mult = 3.0
 
     if signal == "BUY":
         stop = price - atr * stop_mult
@@ -812,10 +862,26 @@ def run():
                 total_score = c["score"]
                 reasons = c["reasons"]
 
+                signal_key = f"{symbol}_{strategy_name}_{signal}"
+
+                current_candle_time = last["time"]
+
+                if last_signal.get(signal_key) == current_candle_time:
+                    continue
+
+                last_signal[signal_key] = current_candle_time
+
                 price = last["close"]
 
-                stop, tp = calculate_levels(
+                entry_price = get_entry_price(
                     price,
+                    last["atr"],
+                    signal,
+                    strategy_name
+                )
+
+                stop, tp = calculate_levels(
+                    entry_price,
                     last["atr"],
                     signal,
                     strategy_name
@@ -824,7 +890,7 @@ def run():
                 send_signal(
                     symbol,
                     signal,
-                    price,
+                    entry_price,
                     stop,
                     tp,
                     reasons,
