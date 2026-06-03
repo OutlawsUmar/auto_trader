@@ -472,7 +472,7 @@ def strategy_expansion_volatility(df, last, trend):
         recent_expansion_candles <= 2
     )
 
-    prev1 = df.iloc[-2]
+    prev1 = df.iloc[-3]
 
     prev1_expansion = (
         abs(prev1["close"] - prev1["open"])
@@ -484,6 +484,7 @@ def strategy_expansion_volatility(df, last, trend):
 
     if (
         atr_expanding
+        and trend == "UP"
         and last["close"] > last["ema50"]
         and last["macd"] > last["macd_signal"]
         and last["close"] > last["open"]
@@ -526,6 +527,7 @@ def strategy_expansion_volatility(df, last, trend):
 
     if (
         atr_expanding
+        and trend == "DOWN"
         and last["close"] < last["ema50"]
         and last["macd"] < last["macd_signal"]
         and last["close"] < last["open"]
@@ -606,18 +608,17 @@ def strategy_liquidity_sweep(df, last, trend):
     strong_high_level = high_touches >= 2
 
     # ================= RANGE STRUCTURE =================
-    # настоящий liquidity любит bounded market
 
     range_size_pct = (
         (prev_high - prev_low) / last["close"]
     )
 
     valid_range = (
-        range_size_pct > 0.006
+        range_size_pct > 0.01
         and range_size_pct < 0.04
     )
 
-    # ================= MARKET ALIVE FILTER =================
+    # ================= MARKET ALIVE =================
 
     atr_pct = atr_avg / last["close"]
 
@@ -635,72 +636,110 @@ def strategy_liquidity_sweep(df, last, trend):
         min(last["close"], last["open"]) - last["low"]
     )
 
-    candle_range = last["high"] - last["low"]
+    candle_range = (
+        last["high"] - last["low"]
+    )
 
     if candle_range == 0:
         return None
 
-    # свеча должна быть реально заметной
-    strong_candle = candle_range > atr_avg * 1.0
+    # ================= PRIMARY FILTERS =================
+    # самые важные
 
-    # тело не микро
-    strong_body = body >= atr_avg * 0.4
+    strong_candle = (
+        candle_range > atr_avg * 1.3
+    )
 
-    # close должен реально reclaim/reject делать
+    lower_wick_pct = (
+        lower_wick / candle_range
+    )
+
+    upper_wick_pct = (
+        upper_wick / candle_range
+    )
+
+    # ================= SECONDARY FILTERS =================
+    # подтверждения
+
+    strong_body = (
+        body >= atr_avg * 0.4
+    )
+
     close_strength_long = (
-        (last["close"] - last["low"]) / candle_range
+        (last["close"] - last["low"])
+        / candle_range
     )
 
     close_strength_short = (
-        (last["high"] - last["close"]) / candle_range
+        (last["high"] - last["close"])
+        / candle_range
     )
 
-    # ================= SWEEPS =================
+    range_low = recent["low"].min()
+    range_high = recent["high"].max()
+    
+    extreme_low = (
+    abs(prev_low - range_low)
+    <= atr_avg * 0.3
+    )
+
+    extreme_high = (
+        abs(prev_high - range_high)
+        <= atr_avg * 0.3
+    )
+    
+    # ================= BUY SWEEP =================
 
     sell_side_sweep = (
+
+        # ===== ОБЯЗАТЕЛЬНЫЕ =====
 
         last["low"] < (prev_low - tolerance)
         and last["close"] > prev_low
 
-        # сильный rejection
-        and lower_wick > body * 1.5
-
-        # свеча живая
-        and strong_candle
-        and strong_body
-
-        # close near high
-        and close_strength_long > 0.65
-
-        # level quality
         and strong_low_level
-
-        # market structure
         and valid_range
+
+        and strong_candle
+
+        # нижняя тень должна занимать
+        # минимум 45% всей свечи
+
+        and lower_wick_pct > 0.45
+
+        # ===== ПОДТВЕРЖДЕНИЯ =====
+
+        and close_strength_long > 0.65
+        and strong_body
         and market_alive
+        and extreme_low
     )
 
+    # ================= SELL SWEEP =================
+
     buy_side_sweep = (
+
+        # ===== ОБЯЗАТЕЛЬНЫЕ =====
 
         last["high"] > (prev_high + tolerance)
         and last["close"] < prev_high
 
-        # сильный rejection
-        and upper_wick > body * 1.5
-
-        # свеча живая
-        and strong_candle
-        and strong_body
-
-        # close near low
-        and close_strength_short > 0.65
-
-        # level quality
         and strong_high_level
-
-        # market structure
         and valid_range
+
+        and strong_candle
+
+        # верхняя тень должна занимать
+        # минимум 45% всей свечи
+
+        and upper_wick_pct > 0.45
+
+        # ===== ПОДТВЕРЖДЕНИЯ =====
+
+        and close_strength_short > 0.65
+        and strong_body
         and market_alive
+        and extreme_high
     )
 
     # ================= BUY =================
@@ -722,7 +761,10 @@ def strategy_liquidity_sweep(df, last, trend):
         return make_candidate(
             "LIQUIDITY",
             "BUY",
-            1.4 + (0.2 if last["volume"] > vol_avg * 1.05 else 0),
+            1.4 + (
+                0.2 if last["volume"] > vol_avg * 1.05
+                else 0
+            ),
             reasons
         )
 
@@ -745,7 +787,10 @@ def strategy_liquidity_sweep(df, last, trend):
         return make_candidate(
             "LIQUIDITY",
             "SELL",
-            1.4 + (0.2 if last["volume"] > vol_avg * 1.05 else 0),
+            1.4 + (
+                0.2 if last["volume"] > vol_avg * 1.05
+                else 0
+            ),
             reasons
         )
 
