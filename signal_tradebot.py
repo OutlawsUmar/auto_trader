@@ -932,6 +932,11 @@ def run():
                     strategy_name
                 )
 
+                risk_pct = abs(entry_price - stop) / entry_price
+
+                if risk_pct < 0.0075 or risk_pct > 0.015:
+                    continue
+
                 send_signal(
                     symbol,
                     signal,
