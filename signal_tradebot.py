@@ -840,8 +840,8 @@ def calculate_levels(price, atr, signal, strategy_name):
     name = (strategy_name or "").upper()
 
     if "LIQUIDITY" in name:
-        stop_mult = 1.0
-        tp_mult = 4.0
+        stop_mult = 1.5
+        tp_mult = 4.5
 
     elif "BREAKOUT" in name:
         stop_mult = 1.5
@@ -934,7 +934,7 @@ def run():
 
                 risk_pct = abs(entry_price - stop) / entry_price
 
-                if risk_pct < 0.0075 or risk_pct > 0.015:
+                if risk_pct < 0.005 or risk_pct > 0.015:
                     continue
 
                 send_signal(
