@@ -4,6 +4,11 @@ from telegram import Bot
 import time
 import datetime
 
+import hmac
+import hashlib
+import requests
+from urllib.parse import urlencode
+
 from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
@@ -13,9 +18,9 @@ API_TOKEN = "8764116821:AAEPAwJq5hy3bAUD7VSdgz7juwfz2i2_kD4"
 CHAT_ID = "-1003978043796"
 
 symbols = [
-    "SOL/USDT", "BNB/USDT", "XRP/USDT", "AVAX/USDT", "LINK/USDT",
-    "SUI/USDT", "NEAR/USDT", "INJ/USDT", "BTC/USDT"
-]   
+    "AVAX/USDT", "LINK/USDT", "SUI/USDT", "NEAR/USDT", "INJ/USDT",
+    "SOL/USDT", "BNB/USDT", "XRP/USDT"
+] 
 
 timeframe = "15m"
 limit = 400
@@ -28,6 +33,7 @@ exchange = ccxt.binance({
         "adjustForTimeDifference": True,
     },
 })
+exchange.load_markets()
 
 last_signal = {}  # чтобы не слать один и тот же сигнал по символу бесконечно
 
@@ -888,10 +894,420 @@ Price: {price:.4f}
     bot.send_message(chat_id=CHAT_ID, text=message)
 
 
-# ================= MAIN =================
+
+
+
+# ================= EXECUTION CONFIG =================
+BINANCE_API_KEY = "u7dAiy2khBOgBiz5T2bSA742Et6AlX9KBxo2cTkvijEfgS9AeTDkJREI9xH7jGk9"
+BINANCE_API_SECRET = "cxaVPBF1CI4cS4BezfrGuJiqp8FP5wLCWjucYLqSXlovbszGrhAKN7sC1Tp4YWmq"
+
+BASE_FUTURES_URL = "https://fapi.binance.com"
+
+LEVERAGE = 1
+BALANCE_USAGE = 0.995          # 99,5% от доступного USDT
+ENTRY_TIMEOUT_SEC = 60 * 60   # 1 час
+RISK_MIN = 0.005
+RISK_MAX = 0.015
+
+TRADE_STATE = {
+    "locked": False,
+    "symbol": None,
+    "signal": None,
+    "strategy": None,
+    "score": None,
+    "reasons": None,
+    "entry_order_id": None,
+    "entry_order_time": None,
+    "entry_price": None,
+    "stop_price": None,
+    "tp_price": None,
+    "amount": None,
+    "position_open": False,
+    "sl_algo_id": None,
+    "tp_algo_id": None,
+}
+
+
+
+def clear_trade_state():
+    TRADE_STATE.update({
+        "locked": False,
+        "symbol": None,
+        "signal": None,
+        "strategy": None,
+        "score": None,
+        "reasons": None,
+        "entry_order_id": None,
+        "entry_order_time": None,
+        "entry_price": None,
+        "stop_price": None,
+        "tp_price": None,
+        "amount": None,
+        "position_open": False,
+        "sl_algo_id": None,
+        "tp_algo_id": None,
+    })
+
+
+def futures_symbol(symbol: str) -> str:
+    return symbol.replace("/", "").replace(":USDT", "")
+
+
+def signed_futures_request(method: str, path: str, params: dict | None = None):
+    params = dict(params or {})
+    params["timestamp"] = int(time.time() * 1000)
+    params["recvWindow"] = 5000
+
+    query = urlencode(params, doseq=True)
+    signature = hmac.new(
+        BINANCE_API_SECRET.encode("utf-8"),
+        query.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+    url = f"{BASE_FUTURES_URL}{path}?{query}&signature={signature}"
+    headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+
+    resp = requests.request(method, url, headers=headers, timeout=20)
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"raw": resp.text}
+
+    if resp.status_code >= 400:
+        raise RuntimeError(f"{method} {path} -> {resp.status_code}: {data}")
+
+    return data
+
+
+def get_free_usdt():
+    bal = exchange.fetch_balance()
+
+    if isinstance(bal.get("USDT"), dict):
+        free = bal["USDT"].get("free")
+        if free is not None:
+            return float(free)
+
+    return float(bal.get("free", {}).get("USDT", 0) or 0)
+
+
+def get_min_notional(symbol: str):
+    market = exchange.market(symbol)
+    cost_min = market.get("limits", {}).get("cost", {}).get("min")
+    if cost_min is None:
+        return None
+    try:
+        return float(cost_min)
+    except Exception:
+        return None
+
+
+def calc_full_size(symbol: str, entry_price: float):
+    free_usdt = get_free_usdt()
+    usable_usdt = free_usdt * BALANCE_USAGE
+    notional = usable_usdt * LEVERAGE
+
+    min_notional = get_min_notional(symbol)
+    if min_notional is not None and notional < min_notional:
+        return None, f"notional {notional:.4f} < min_notional {min_notional:.4f}"
+
+    raw_qty = notional / entry_price
+    qty = float(exchange.amount_to_precision(symbol, raw_qty))
+
+    if qty <= 0:
+        return None, "qty rounded to zero"
+
+    rounded_notional = qty * entry_price
+    if min_notional is not None and rounded_notional < min_notional:
+        return None, f"rounded notional {rounded_notional:.4f} < min_notional {min_notional:.4f}"
+
+    return qty, None
+
+
+def set_leverage(symbol: str, leverage: int = 1):
+    return signed_futures_request("POST", "/fapi/v1/leverage", {
+        "symbol": futures_symbol(symbol),
+        "leverage": leverage,
+    })
+
+
+def place_limit_entry(symbol: str, signal: str, qty: float, entry_price: float):
+    side = "BUY" if signal == "BUY" else "SELL"
+    client_id = f"entry_{futures_symbol(symbol)}_{int(time.time() * 1000)}"
+
+    return signed_futures_request("POST", "/fapi/v1/order", {
+        "symbol": futures_symbol(symbol),
+        "side": side,
+        "type": "LIMIT",
+        "timeInForce": "GTC",
+        "quantity": qty,
+        "price": entry_price,
+        "newClientOrderId": client_id,
+    })
+
+
+def place_sl_tp(symbol: str, signal: str, qty: float, stop_price: float, tp_price: float):
+    # Binance USD-M Futures conditional orders (Algo Service)
+    exit_side = "SELL" if signal == "BUY" else "BUY"
+
+    stop_order = signed_futures_request("POST", "/fapi/v1/algoOrder", {
+        "algoType": "CONDITIONAL",
+        "symbol": futures_symbol(symbol),
+        "side": exit_side,
+        "type": "STOP_MARKET",
+        "quantity": qty,
+        "triggerPrice": stop_price,
+        "workingType": "CONTRACT_PRICE",
+    })
+
+    tp_order = signed_futures_request("POST", "/fapi/v1/algoOrder", {
+        "algoType": "CONDITIONAL",
+        "symbol": futures_symbol(symbol),
+        "side": exit_side,
+        "type": "TAKE_PROFIT_MARKET",
+        "quantity": qty,
+        "triggerPrice": tp_price,
+        "workingType": "CONTRACT_PRICE",
+    })
+
+    return stop_order, tp_order
+
+
+def cancel_entry_order(symbol: str, order_id: int | str):
+    return signed_futures_request("DELETE", "/fapi/v1/order", {
+        "symbol": futures_symbol(symbol),
+        "orderId": order_id,
+    })
+
+
+def cancel_all_symbol_orders(symbol: str):
+    # regular open orders
+    try:
+        signed_futures_request("DELETE", "/fapi/v1/allOpenOrders", {
+            "symbol": futures_symbol(symbol),
+        })
+    except Exception as e:
+        print(f"[{symbol}] cancel all open orders warn: {e}")
+
+    # algo/conditional open orders
+    try:
+        signed_futures_request("DELETE", "/fapi/v1/algoOpenOrders", {
+            "symbol": futures_symbol(symbol),
+        })
+    except Exception as e:
+        print(f"[{symbol}] cancel all algo orders warn: {e}")
+
+
+def get_position_amt(symbol: str) -> float:
+    # /fapi/v2/positionRisk returns current futures position snapshot
+    data = signed_futures_request("GET", "/fapi/v2/positionRisk", {})
+    fsym = futures_symbol(symbol)
+
+    for row in data:
+        if row.get("symbol") == fsym:
+            try:
+                return float(row.get("positionAmt", 0) or 0)
+            except Exception:
+                return 0.0
+
+    return 0.0
+
+
+def manage_active_trade():
+    if not TRADE_STATE["locked"] or not TRADE_STATE["symbol"]:
+        return
+
+    symbol = TRADE_STATE["symbol"]
+
+    try:
+        pos_amt = abs(get_position_amt(symbol))
+    except Exception as e:
+        print(f"[{symbol}] position check error: {e}")
+        return
+
+    # 1) If position is already open, make sure SL/TP exist
+    if pos_amt > 0:
+        if not TRADE_STATE["position_open"]:
+            TRADE_STATE["position_open"] = True
+
+            # cancel leftover entry if it still exists
+            if TRADE_STATE["entry_order_id"] is not None:
+                try:
+                    cancel_entry_order(symbol, TRADE_STATE["entry_order_id"])
+                except Exception as e:
+                    print(f"[{symbol}] entry cancel warning: {e}")
+
+            # place SL / TP once
+            if TRADE_STATE["sl_algo_id"] is None and TRADE_STATE["tp_algo_id"] is None:
+                try:
+                    sl, tp = place_sl_tp(
+                        symbol=symbol,
+                        signal=TRADE_STATE["signal"],
+                        qty=pos_amt,
+                        stop_price=float(exchange.price_to_precision(symbol, TRADE_STATE["stop_price"])),
+                        tp_price=float(exchange.price_to_precision(symbol, TRADE_STATE["tp_price"]))
+                    )
+                    TRADE_STATE["sl_algo_id"] = sl.get("algoId") or sl.get("orderId")
+                    TRADE_STATE["tp_algo_id"] = tp.get("algoId") or tp.get("orderId")
+
+                    bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=(
+                            f"✅ {symbol} position filled\n"
+                            f"SL/TP attached\n"
+                            f"Signal: {TRADE_STATE['signal']} | {TRADE_STATE['strategy']}\n"
+                            f"Qty: {pos_amt}\n"
+                            f"Entry: {TRADE_STATE['entry_price']:.4f}\n"
+                            f"SL: {TRADE_STATE['stop_price']:.4f}\n"
+                            f"TP: {TRADE_STATE['tp_price']:.4f}"
+                        )
+                    )
+                except Exception as e:
+                    print(f"[{symbol}] bracket attach error: {e}")
+
+        return
+
+    # 2) If no position, monitor pending entry order timeout / cancellation
+    if TRADE_STATE["entry_order_id"] is not None:
+        elapsed = time.time() - TRADE_STATE["entry_order_time"]
+
+        if elapsed >= ENTRY_TIMEOUT_SEC:
+            try:
+                cancel_entry_order(symbol, TRADE_STATE["entry_order_id"])
+            except Exception as e:
+                print(f"[{symbol}] timeout cancel warning: {e}")
+
+            bot.send_message(
+                chat_id=CHAT_ID,
+                text=f"⏱ {symbol} entry order canceled after 1h timeout"
+            )
+            clear_trade_state()
+            return
+
+        # optional status check for hard cancel/reject
+        try:
+            order = signed_futures_request("GET", "/fapi/v1/order", {
+                "symbol": futures_symbol(symbol),
+                "orderId": TRADE_STATE["entry_order_id"],
+            })
+            status = str(order.get("status", "")).upper()
+            if status in ("CANCELED", "REJECTED", "EXPIRED"):
+                bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=f"⚠️ {symbol} entry order finished with status: {status}"
+                )
+                clear_trade_state()
+                return
+        except Exception as e:
+            print(f"[{symbol}] entry status check warning: {e}")
+
+
+def try_execute_candidate(symbol, c, last):
+    if TRADE_STATE["locked"]:
+        return False
+
+    signal = c["signal"]
+    strategy_name = c["strategy"]
+    total_score = c["score"]
+    reasons = c["reasons"]
+
+    price = float(last["close"])
+
+    entry_price = get_entry_price(
+        price,
+        float(last["atr"]),
+        signal,
+        strategy_name,
+        last=last
+    )
+    entry_price = float(exchange.price_to_precision(symbol, entry_price))
+
+    stop, tp = calculate_levels(
+        entry_price,
+        float(last["atr"]),
+        signal,
+        strategy_name
+    )
+    stop = float(exchange.price_to_precision(symbol, stop))
+    tp = float(exchange.price_to_precision(symbol, tp))
+
+    risk_pct = abs(entry_price - stop) / entry_price
+    if risk_pct < RISK_MIN or risk_pct > RISK_MAX:
+        print(f"[{symbol}] skip risk_pct={risk_pct:.4f}")
+        return False
+
+    qty, reason = calc_full_size(symbol, entry_price)
+    if qty is None:
+        print(f"[{symbol}] skip sizing: {reason}")
+        return False
+
+    try:
+        set_leverage(symbol, LEVERAGE)
+    except Exception as e:
+        print(f"[{symbol}] leverage error: {e}")
+        return False
+
+    side = "BUY" if signal == "BUY" else "SELL"
+
+    try:
+        entry_order = place_limit_entry(symbol, signal, qty, entry_price)
+    except Exception as e:
+        print(f"[{symbol}] entry order error: {e}")
+        return False
+
+    TRADE_STATE.update({
+        "locked": True,
+        "symbol": symbol,
+        "signal": signal,
+        "strategy": strategy_name,
+        "score": total_score,
+        "reasons": reasons,
+        "entry_order_id": entry_order.get("orderId"),
+        "entry_order_time": time.time(),
+        "entry_price": entry_price,
+        "stop_price": stop,
+        "tp_price": tp,
+        "amount": qty,
+        "position_open": False,
+        "sl_algo_id": None,
+        "tp_algo_id": None,
+    })
+
+    bot.send_message(
+        chat_id=CHAT_ID,
+        text=(
+            f"📊 {symbol} SIGNAL: {signal}\n"
+            f"Strategy: {strategy_name}\n"
+            f"Confluence: {total_score:.1f}\n\n"
+            f"Mode: LIVE LIMIT ENTRY | 1x\n"
+            f"Balance use: {BALANCE_USAGE*100:.0f}%\n\n"
+            f"Entry: {entry_price:.4f}\n"
+            f"Stop: {stop:.4f}\n"
+            f"TP: {tp:.4f}\n"
+            f"Qty: {qty}\n\n"
+            f"Reasons:\n{chr(10).join(reasons)}\n\n"
+            f"Entry order id: {TRADE_STATE['entry_order_id']}"
+        )
+    )
+
+    print(f"ENTRY placed: {symbol} {signal} | {strategy_name} | qty={qty}")
+    return True
+
+
+
+
+# ================= MAIN SCAN =================
 def run():
+    # если уже есть активный pending order / position, новые сигналы игнорируем
+    if TRADE_STATE["locked"]:
+        return
+
     for symbol in symbols:
         time.sleep(2)
+
+        # ещё раз: если уже что-то открылось по более приоритетному символу
+        if TRADE_STATE["locked"]:
+            return
 
         df = get_data(symbol)
 
@@ -900,85 +1316,44 @@ def run():
             continue
 
         df = add_indicators(df)
-
         candidates, last = analyze(df, symbol)
 
-        if candidates:
-            for c in candidates:
-
-                signal = c["signal"]
-                strategy_name = c["strategy"]
-                total_score = c["score"]
-                reasons = c["reasons"]
-
-                signal_key = f"{symbol}_{strategy_name}_{signal}"
-
-                current_candle_time = last["time"]
-
-                if last_signal.get(signal_key) == current_candle_time:
-                    continue
-
-                last_signal[signal_key] = current_candle_time
-
-                price = last["close"]
-
-                entry_price = get_entry_price(
-                    price,
-                    last["atr"],
-                    signal,
-                    strategy_name
-                )
-
-                stop, tp = calculate_levels(
-                    entry_price,
-                    last["atr"],
-                    signal,
-                    strategy_name
-                )
-
-                risk_pct = abs(entry_price - stop) / entry_price
-
-                if risk_pct < 0.006 or risk_pct > 0.015:
-                    continue
-
-                send_signal(
-                    symbol,
-                    signal,
-                    entry_price,
-                    stop,
-                    tp,
-                    reasons,
-                    strategy_name,
-                    total_score
-                )
-
-                print(
-                    f"Signal sent: {symbol} "
-                    f"{signal} | {strategy_name} "
-                    f"| Score: {total_score:.1f}"
-                )
-
-        else:
+        if not candidates:
             print(f"No signal: {symbol}")
+            continue
+
+        # сначала TREND, потом EXPANSION (потому что analyze() уже возвращает их в этом порядке)
+        for c in candidates:
+            signal_key = f"{symbol}_{c['strategy']}_{c['signal']}"
+            candle_time = last["time"]
+
+            if last_signal.get(signal_key) == candle_time:
+                continue
+
+            placed = try_execute_candidate(symbol, c, last)
+            if placed:
+                last_signal[signal_key] = candle_time
+                return  # одна сделка за раз, остальные сигналы игнорируем
 
 
 # ================= LOOP =================
 while True:
     try:
+        manage_active_trade()
+
         now = datetime.datetime.now(datetime.timezone.utc)
 
-        # Анализируем сразу после закрытия 15m-свечи
-        # UTC минуты: 01, 16, 31, 46
+        # анализируем сразу после закрытия 15m-свечи
         if now.minute in [1, 16, 31, 46]:
-            print(f"\n=== RUNNING ANALYSIS {now} ===")
-            run()
-
-            # защита от повторного запуска в ту же минуту
-            time.sleep(60)
+            if not TRADE_STATE["locked"]:
+                print(f"\n=== RUNNING ANALYSIS {now} ===")
+                run()
+                time.sleep(60)
+            else:
+                time.sleep(5)
         else:
-            # лёгкая проверка времени, нагрузки почти нет
             time.sleep(5)
 
     except Exception as e:
         print("Error:", e)
-        time.sleep(60)
+        time.sleep(5)
