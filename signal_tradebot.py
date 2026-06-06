@@ -805,32 +805,36 @@ def analyze(df, symbol):
     candidates = []
 
     c1 = strategy_trend_pullback(df, last, trend)
-    c2 = strategy_breakout_compression(df, last)
+    # c2 = strategy_breakout_compression(df, last)
     c3 = strategy_expansion_volatility(df, last, trend)
-    c4 = strategy_liquidity_sweep(df, last, trend)
+    # c4 = strategy_liquidity_sweep(df, last, trend)
 
-    for c in [c1, c2, c3, c4]:
+    for c in (c1, c3):
         if c is not None:
             candidates.append(c)
 
     return candidates, last
 
 
-def get_entry_price(price, atr, signal, strategy_name):
+def get_entry_price(price, atr, signal, strategy_name, last=None):
+    name = (strategy_name or "").upper()
 
-    if "TREND" in strategy_name:
+    # TREND
+    if "TREND" in name:
+        return price - atr * 0.5 if signal == "BUY" else price + atr * 0.5
 
-        if signal == "BUY":
-            return price - atr * 0.2
-        else:
-            return price + atr * 0.2
+    # EXPANSION
+    elif "EXPANSION" in name:
 
-    elif "LIQUIDITY" in strategy_name:
+        if last is not None:
+            candle_range = last["high"] - last["low"]
 
-        if signal == "BUY":
-            return price - atr * 0.3
-        else:
-            return price + atr * 0.3
+            if signal == "BUY":
+                return last["high"] - candle_range * 0.5
+            else:
+                return last["low"] + candle_range * 0.5
+
+        return price
 
     return price
 
@@ -840,8 +844,8 @@ def calculate_levels(price, atr, signal, strategy_name):
     name = (strategy_name or "").upper()
 
     if "LIQUIDITY" in name:
-        stop_mult = 1.5
-        tp_mult = 4.5
+        stop_mult = 1.0
+        tp_mult = 4.0
 
     elif "BREAKOUT" in name:
         stop_mult = 1.5
@@ -852,7 +856,7 @@ def calculate_levels(price, atr, signal, strategy_name):
         tp_mult = 6.0
     else:
         stop_mult = 1.0
-        tp_mult = 3.0
+        tp_mult = 4.0
 
     if signal == "BUY":
         stop = price - atr * stop_mult
@@ -934,7 +938,7 @@ def run():
 
                 risk_pct = abs(entry_price - stop) / entry_price
 
-                if risk_pct < 0.005 or risk_pct > 0.015:
+                if risk_pct < 0.006 or risk_pct > 0.015:
                     continue
 
                 send_signal(
