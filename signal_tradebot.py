@@ -3,6 +3,7 @@ import pandas as pd
 from telegram import Bot
 import time
 import datetime
+import math
 
 import hmac
 import hashlib
@@ -17,9 +18,21 @@ from ta.volatility import AverageTrueRange
 API_TOKEN = "8764116821:AAEPAwJq5hy3bAUD7VSdgz7juwfz2i2_kD4"
 CHAT_ID = "-1003978043796"
 
+
+BINANCE_API_KEY = "u7dAiy2khBOgBiz5T2bSA742Et6AlX9KBxo2cTkvijEfgS9AeTDkJREI9xH7jGk9"
+BINANCE_API_SECRET = "cxaVPBF1CI4cS4BezfrGuJiqp8FP5wLCWjucYLqSXlovbszGrhAKN7sC1Tp4YWmq"
+
+BASE_FUTURES_URL = "https://fapi.binance.com"
+
+LEVERAGE = 7
+BALANCE_USAGE = 0.99          # 99,5% от доступного USDT
+ENTRY_TIMEOUT_SEC = 60 * 60   # 1 час
+RISK_MIN = 0.005
+RISK_MAX = 0.15
+
 symbols = [
-    "AVAX/USDT", "LINK/USDT", "SUI/USDT", "NEAR/USDT", "INJ/USDT",
-    "SOL/USDT", "BNB/USDT", "XRP/USDT"
+    "AVAX/USDT", "LINK/USDT", "INJ/USDT", "XRP/USDT",  
+    "NEAR/USDT", "SUI/USDT", "SOL/USDT", "BNB/USDT" 
 ] 
 
 timeframe = "15m"
@@ -27,10 +40,13 @@ limit = 400
 
 bot = Bot(token=API_TOKEN)
 exchange = ccxt.binance({
+    "apiKey": BINANCE_API_KEY,
+    "secret": BINANCE_API_SECRET,
     "enableRateLimit": True,
     "timeout": 20000,
     "options": {
         "adjustForTimeDifference": True,
+        "defaultType": "future",
     },
 })
 exchange.load_markets()
@@ -861,7 +877,7 @@ def calculate_levels(price, atr, signal, strategy_name):
         stop_mult = 1.5
         tp_mult = 6.0
     else:
-        stop_mult = 1.0
+        stop_mult = 1.0 #1 
         tp_mult = 4.0
 
     if signal == "BUY":
@@ -898,16 +914,7 @@ Price: {price:.4f}
 
 
 # ================= EXECUTION CONFIG =================
-BINANCE_API_KEY = "u7dAiy2khBOgBiz5T2bSA742Et6AlX9KBxo2cTkvijEfgS9AeTDkJREI9xH7jGk9"
-BINANCE_API_SECRET = "cxaVPBF1CI4cS4BezfrGuJiqp8FP5wLCWjucYLqSXlovbszGrhAKN7sC1Tp4YWmq"
 
-BASE_FUTURES_URL = "https://fapi.binance.com"
-
-LEVERAGE = 1
-BALANCE_USAGE = 0.995          # 99,5% от доступного USDT
-ENTRY_TIMEOUT_SEC = 60 * 60   # 1 час
-RISK_MIN = 0.005
-RISK_MAX = 0.015
 
 TRADE_STATE = {
     "locked": False,
@@ -953,7 +960,22 @@ def futures_symbol(symbol: str) -> str:
     return symbol.replace("/", "").replace(":USDT", "")
 
 
+def send_telegram_safe(text: str, chat_id=None):
+    chat_id = chat_id or CHAT_ID
+
+    for _ in range(3):
+        try:
+            bot.send_message(chat_id=chat_id, text=text)
+            return True
+        except Exception as e:
+            print(f"[TELEGRAM ERROR] {e}")
+            time.sleep(0.5)
+
+    return False
+
+
 def signed_futures_request(method: str, path: str, params: dict | None = None):
+    method = method.upper()
     params = dict(params or {})
     params["timestamp"] = int(time.time() * 1000)
     params["recvWindow"] = 5000
@@ -968,16 +990,27 @@ def signed_futures_request(method: str, path: str, params: dict | None = None):
     url = f"{BASE_FUTURES_URL}{path}?{query}&signature={signature}"
     headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
 
-    resp = requests.request(method, url, headers=headers, timeout=20)
-    try:
-        data = resp.json()
-    except Exception:
-        data = {"raw": resp.text}
+    # легкий retry только для GET/DELETE
+    attempts = 2 if method in ("GET", "DELETE") else 1
 
-    if resp.status_code >= 400:
-        raise RuntimeError(f"{method} {path} -> {resp.status_code}: {data}")
+    for attempt in range(attempts):
+        try:
+            resp = requests.request(method, url, headers=headers, timeout=20)
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"raw": resp.text}
 
-    return data
+            if resp.status_code >= 400:
+                raise RuntimeError(f"{method} {path} -> {resp.status_code}: {data}")
+
+            return data
+
+        except requests.exceptions.RequestException as e:
+            if attempt < attempts - 1:
+                time.sleep(0.5)
+                continue
+            raise e
 
 
 def get_free_usdt():
@@ -1002,24 +1035,58 @@ def get_min_notional(symbol: str):
         return None
 
 
+def get_step_size(symbol: str):
+    market = exchange.market(symbol)
+    for f in market.get("info", {}).get("filters", []):
+        if f.get("filterType") == "LOT_SIZE":
+            return float(f.get("stepSize", 1))
+    return 1.0
+
+
+def get_min_amount(symbol: str):
+    market = exchange.market(symbol)
+    min_amt = market.get("limits", {}).get("amount", {}).get("min")
+    if min_amt is not None:
+        try:
+            return float(min_amt)
+        except Exception:
+            return 0.0
+    return get_step_size(symbol)
+
+
+def floor_to_step(qty: float, step: float) -> float:
+    if step <= 0:
+        return qty
+    return math.floor(qty / step) * step
+
+
 def calc_full_size(symbol: str, entry_price: float):
     free_usdt = get_free_usdt()
     usable_usdt = free_usdt * BALANCE_USAGE
     notional = usable_usdt * LEVERAGE
 
     min_notional = get_min_notional(symbol)
-    if min_notional is not None and notional < min_notional:
-        return None, f"notional {notional:.4f} < min_notional {min_notional:.4f}"
+    min_amount = get_min_amount(symbol)
+    step = get_step_size(symbol)
+
+    if min_notional and notional < min_notional:
+        return None, "notional too small"
 
     raw_qty = notional / entry_price
-    qty = float(exchange.amount_to_precision(symbol, raw_qty))
 
+    # 🔥 правильное floor к stepSize (через деление)
+    qty = math.floor(raw_qty / step) * step
+
+    # 🔥 защита от float мусора
+    qty = float(f"{qty:.8f}")
+
+    # ❌ защита от 0
     if qty <= 0:
-        return None, "qty rounded to zero"
+        return None, "qty <= 0"
 
-    rounded_notional = qty * entry_price
-    if min_notional is not None and rounded_notional < min_notional:
-        return None, f"rounded notional {rounded_notional:.4f} < min_notional {min_notional:.4f}"
+    # ❌ min amount check
+    if min_amount and qty < min_amount:
+        return None, f"qty {qty} < min_amount {min_amount}"
 
     return qty, None
 
@@ -1047,7 +1114,6 @@ def place_limit_entry(symbol: str, signal: str, qty: float, entry_price: float):
 
 
 def place_sl_tp(symbol: str, signal: str, qty: float, stop_price: float, tp_price: float):
-    # Binance USD-M Futures conditional orders (Algo Service)
     exit_side = "SELL" if signal == "BUY" else "BUY"
 
     stop_order = signed_futures_request("POST", "/fapi/v1/algoOrder", {
@@ -1081,7 +1147,6 @@ def cancel_entry_order(symbol: str, order_id: int | str):
 
 
 def cancel_all_symbol_orders(symbol: str):
-    # regular open orders
     try:
         signed_futures_request("DELETE", "/fapi/v1/allOpenOrders", {
             "symbol": futures_symbol(symbol),
@@ -1089,7 +1154,6 @@ def cancel_all_symbol_orders(symbol: str):
     except Exception as e:
         print(f"[{symbol}] cancel all open orders warn: {e}")
 
-    # algo/conditional open orders
     try:
         signed_futures_request("DELETE", "/fapi/v1/algoOpenOrders", {
             "symbol": futures_symbol(symbol),
@@ -1099,7 +1163,6 @@ def cancel_all_symbol_orders(symbol: str):
 
 
 def get_position_amt(symbol: str) -> float:
-    # /fapi/v2/positionRisk returns current futures position snapshot
     data = signed_futures_request("GET", "/fapi/v2/positionRisk", {})
     fsym = futures_symbol(symbol)
 
@@ -1113,93 +1176,190 @@ def get_position_amt(symbol: str) -> float:
     return 0.0
 
 
-def manage_active_trade():
-    if not TRADE_STATE["locked"] or not TRADE_STATE["symbol"]:
+def safe_cancel_entry(symbol: str):
+    order_id = TRADE_STATE.get("entry_order_id")
+    if not order_id:
         return
-
-    symbol = TRADE_STATE["symbol"]
 
     try:
-        pos_amt = abs(get_position_amt(symbol))
-    except Exception as e:
-        print(f"[{symbol}] position check error: {e}")
-        return
+        order = signed_futures_request("GET", "/fapi/v1/order", {
+            "symbol": futures_symbol(symbol),
+            "orderId": order_id,
+        })
 
-    # 1) If position is already open, make sure SL/TP exist
-    if pos_amt > 0:
-        if not TRADE_STATE["position_open"]:
-            TRADE_STATE["position_open"] = True
+        status = (order.get("status") or "").upper()
 
-            # cancel leftover entry if it still exists
-            if TRADE_STATE["entry_order_id"] is not None:
-                try:
-                    cancel_entry_order(symbol, TRADE_STATE["entry_order_id"])
-                except Exception as e:
-                    print(f"[{symbol}] entry cancel warning: {e}")
+        # уже не активен → чистим state
+        if status in ("FILLED", "CANCELED", "REJECTED", "EXPIRED"):
+            TRADE_STATE["entry_order_id"] = None
+            TRADE_STATE["entry_order_time"] = None
+            return
 
-            # place SL / TP once
-            if TRADE_STATE["sl_algo_id"] is None and TRADE_STATE["tp_algo_id"] is None:
-                try:
-                    sl, tp = place_sl_tp(
-                        symbol=symbol,
-                        signal=TRADE_STATE["signal"],
-                        qty=pos_amt,
-                        stop_price=float(exchange.price_to_precision(symbol, TRADE_STATE["stop_price"])),
-                        tp_price=float(exchange.price_to_precision(symbol, TRADE_STATE["tp_price"]))
-                    )
-                    TRADE_STATE["sl_algo_id"] = sl.get("algoId") or sl.get("orderId")
-                    TRADE_STATE["tp_algo_id"] = tp.get("algoId") or tp.get("orderId")
-
-                    bot.send_message(
-                        chat_id=CHAT_ID,
-                        text=(
-                            f"✅ {symbol} position filled\n"
-                            f"SL/TP attached\n"
-                            f"Signal: {TRADE_STATE['signal']} | {TRADE_STATE['strategy']}\n"
-                            f"Qty: {pos_amt}\n"
-                            f"Entry: {TRADE_STATE['entry_price']:.4f}\n"
-                            f"SL: {TRADE_STATE['stop_price']:.4f}\n"
-                            f"TP: {TRADE_STATE['tp_price']:.4f}"
-                        )
-                    )
-                except Exception as e:
-                    print(f"[{symbol}] bracket attach error: {e}")
-
-        return
-
-    # 2) If no position, monitor pending entry order timeout / cancellation
-    if TRADE_STATE["entry_order_id"] is not None:
-        elapsed = time.time() - TRADE_STATE["entry_order_time"]
-
-        if elapsed >= ENTRY_TIMEOUT_SEC:
+        # отменяем только если реально живой ордер
+        if status in ("NEW", "PARTIALLY_FILLED"):
             try:
-                cancel_entry_order(symbol, TRADE_STATE["entry_order_id"])
+                cancel_entry_order(symbol, order_id)
             except Exception as e:
-                print(f"[{symbol}] timeout cancel warning: {e}")
+                if "Unknown order sent" in str(e):
+                    TRADE_STATE["entry_order_id"] = None
+                    TRADE_STATE["entry_order_time"] = None
+                else:
+                    raise e
 
-            bot.send_message(
-                chat_id=CHAT_ID,
-                text=f"⏱ {symbol} entry order canceled after 1h timeout"
-            )
+    except Exception as e:
+        print(f"[{symbol}] safe cancel error: {e}")
+
+
+def verify_sl_tp(symbol: str):
+    try:
+        orders = signed_futures_request("GET", "/fapi/v1/openOrders", {
+            "symbol": futures_symbol(symbol)
+        })
+    except Exception as e:
+        print(f"[{symbol}] verify_sl_tp error: {e}")
+        return False, False
+
+    sl = False
+    tp = False
+
+    for o in orders or []:
+        t = o.get("type")
+        if t == "STOP_MARKET":
+            sl = True
+        elif t == "TAKE_PROFIT_MARKET":
+            tp = True
+
+    return sl, tp
+
+
+def attach_sl_tp(symbol, signal, qty, stop_price, tp_price) -> bool:
+    try:
+        sl_ok, tp_ok = verify_sl_tp(symbol)
+
+        # уже есть на бирже
+        if sl_ok and tp_ok:
+            return True
+
+        sl, tp = place_sl_tp(
+            symbol=symbol,
+            signal=signal,
+            qty=qty,
+            stop_price=stop_price,
+            tp_price=tp_price
+        )
+
+        # финальная проверка (реальная биржа)
+        sl_ok, tp_ok = verify_sl_tp(symbol)
+
+        return sl_ok and tp_ok
+
+    except Exception as e:
+        print(f"[{symbol}] SL/TP attach error: {e}")
+        return False
+
+def cleanup_sl_tp(symbol):
+    try:
+        cancel_all_symbol_orders(symbol)
+    except Exception as e:
+        print(f"[{symbol}] cleanup error: {e}")
+
+    TRADE_STATE["sl_algo_id"] = None
+    TRADE_STATE["tp_algo_id"] = None
+
+
+def manage_active_trade():
+    try:
+        symbol = TRADE_STATE.get("symbol")
+        if not symbol:
+            return
+
+        try:
+            pos_amt = abs(get_position_amt(symbol))
+        except Exception as e:
+            print(f"[{symbol}] position check error: {e}")
+            return
+
+        # =========================
+        # SYNC STATE
+        # =========================
+        if pos_amt > 0:
+            TRADE_STATE["position_open"] = True
+            TRADE_STATE["locked"] = True
+
+        if not TRADE_STATE["locked"]:
+            return
+
+        # =========================
+        # POSITION OPEN
+        # =========================
+        if pos_amt > 0:
+
+            if TRADE_STATE["sl_algo_id"] is None or TRADE_STATE["tp_algo_id"] is None:
+
+                safe_cancel_entry(symbol)
+
+                ok = attach_sl_tp(
+                    symbol=symbol,
+                    signal=TRADE_STATE["signal"],
+                    qty=pos_amt,
+                    stop_price=float(exchange.price_to_precision(symbol, TRADE_STATE["stop_price"])),
+                    tp_price=float(exchange.price_to_precision(symbol, TRADE_STATE["tp_price"]))
+                )
+
+                if ok:
+                    send_telegram_safe(f"✅ {symbol} SL/TP attached")
+
+            return
+
+        # =========================
+        # ENTRY CHECK
+        # =========================
+        if TRADE_STATE.get("entry_order_id"):
+
+            elapsed = time.time() - TRADE_STATE.get("entry_order_time", time.time())
+
+            if elapsed >= ENTRY_TIMEOUT_SEC:
+                safe_cancel_entry(symbol)
+                send_telegram_safe(f"⏱ {symbol} entry timeout cancel")
+                clear_trade_state()
+                return
+
+            try:
+                order = signed_futures_request("GET", "/fapi/v1/order", {
+                    "symbol": futures_symbol(symbol),
+                    "orderId": TRADE_STATE["entry_order_id"],
+                })
+
+                status = (order.get("status") or "").upper()
+
+                if status in ("CANCELED", "REJECTED", "EXPIRED"):
+                    safe_cancel_entry(symbol)
+                    send_telegram_safe(f"⚠️ {symbol} entry finished: {status}")
+                    clear_trade_state()
+                    return
+
+            except Exception as e:
+                print(f"[{symbol}] entry check error: {e}")
+
+        # =========================
+        # POSITION CLOSED
+        # =========================
+        if pos_amt == 0 and TRADE_STATE["position_open"]:
+
+            TRADE_STATE["position_open"] = False
+
+            try:
+                cancel_all_symbol_orders(symbol)
+            except Exception as e:
+                print(f"[{symbol}] cleanup error: {e}")
+
+            send_telegram_safe(f"🧹 {symbol} position closed → cleaned")
+
             clear_trade_state()
             return
 
-        # optional status check for hard cancel/reject
-        try:
-            order = signed_futures_request("GET", "/fapi/v1/order", {
-                "symbol": futures_symbol(symbol),
-                "orderId": TRADE_STATE["entry_order_id"],
-            })
-            status = str(order.get("status", "")).upper()
-            if status in ("CANCELED", "REJECTED", "EXPIRED"):
-                bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=f"⚠️ {symbol} entry order finished with status: {status}"
-                )
-                clear_trade_state()
-                return
-        except Exception as e:
-            print(f"[{symbol}] entry status check warning: {e}")
+    except Exception as e:
+        print(f"[MANAGE_ACTIVE_TRADE CRASH] {e}")
 
 
 def try_execute_candidate(symbol, c, last):
@@ -1273,7 +1433,7 @@ def try_execute_candidate(symbol, c, last):
         "tp_algo_id": None,
     })
 
-    bot.send_message(
+    send_telegram_safe(
         chat_id=CHAT_ID,
         text=(
             f"📊 {symbol} SIGNAL: {signal}\n"
