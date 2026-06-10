@@ -24,11 +24,12 @@ BINANCE_API_SECRET = "cxaVPBF1CI4cS4BezfrGuJiqp8FP5wLCWjucYLqSXlovbszGrhAKN7sC1T
 
 BASE_FUTURES_URL = "https://fapi.binance.com"
 
-LEVERAGE = 7
+LEVERAGE = 3
 BALANCE_USAGE = 0.99          # 99,5% от доступного USDT
 ENTRY_TIMEOUT_SEC = 60 * 60   # 1 час
 RISK_MIN = 0.005
 RISK_MAX = 0.15
+TIME_OFFSET_MS = 0
 
 symbols = [
     "AVAX/USDT", "LINK/USDT", "INJ/USDT", "XRP/USDT",  
@@ -932,6 +933,8 @@ TRADE_STATE = {
     "position_open": False,
     "sl_algo_id": None,
     "tp_algo_id": None,
+    "sl_tp_attempted": False,
+    "sl_tp_requested": False,
 }
 
 
@@ -953,6 +956,8 @@ def clear_trade_state():
         "position_open": False,
         "sl_algo_id": None,
         "tp_algo_id": None,
+        "sl_tp_attempted": False,
+        "sl_tp_requested": False,
     })
 
 
@@ -961,24 +966,33 @@ def futures_symbol(symbol: str) -> str:
 
 
 def send_telegram_safe(text: str, chat_id=None):
-    chat_id = chat_id or CHAT_ID
+    chat_id = CHAT_ID if chat_id is None else chat_id
 
-    for _ in range(3):
+    for attempt in range(3):
         try:
             bot.send_message(chat_id=chat_id, text=text)
             return True
-        except Exception as e:
-            print(f"[TELEGRAM ERROR] {e}")
-            time.sleep(0.5)
 
+        except Exception as e:
+            print(f"[TELEGRAM ERROR attempt {attempt+1}/3] {e}")
+            time.sleep(0.8)
+
+    print(f"[TELEGRAM FAIL] message not sent: {text[:50]}")
     return False
 
+
+def sync_binance_time():
+    global TIME_OFFSET_MS
+    r = requests.get(f"{BASE_FUTURES_URL}/fapi/v1/time", timeout=10)
+    r.raise_for_status()
+    server_time = int(r.json()["serverTime"])
+    TIME_OFFSET_MS = server_time - int(time.time() * 1000)
 
 def signed_futures_request(method: str, path: str, params: dict | None = None):
     method = method.upper()
     params = dict(params or {})
-    params["timestamp"] = int(time.time() * 1000)
-    params["recvWindow"] = 5000
+    params["timestamp"] = int(time.time() * 1000) + TIME_OFFSET_MS
+    params["recvWindow"] = 20000
 
     query = urlencode(params, doseq=True)
     signature = hmac.new(
@@ -990,7 +1004,6 @@ def signed_futures_request(method: str, path: str, params: dict | None = None):
     url = f"{BASE_FUTURES_URL}{path}?{query}&signature={signature}"
     headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
 
-    # легкий retry только для GET/DELETE
     attempts = 2 if method in ("GET", "DELETE") else 1
 
     for attempt in range(attempts):
@@ -1002,6 +1015,9 @@ def signed_futures_request(method: str, path: str, params: dict | None = None):
                 data = {"raw": resp.text}
 
             if resp.status_code >= 400:
+                if isinstance(data, dict) and data.get("code") == -1021 and attempt == 0:
+                    sync_binance_time()
+                    continue
                 raise RuntimeError(f"{method} {path} -> {resp.status_code}: {data}")
 
             return data
@@ -1189,13 +1205,11 @@ def safe_cancel_entry(symbol: str):
 
         status = (order.get("status") or "").upper()
 
-        # уже не активен → чистим state
         if status in ("FILLED", "CANCELED", "REJECTED", "EXPIRED"):
             TRADE_STATE["entry_order_id"] = None
             TRADE_STATE["entry_order_time"] = None
             return
 
-        # отменяем только если реально живой ордер
         if status in ("NEW", "PARTIALLY_FILLED"):
             try:
                 cancel_entry_order(symbol, order_id)
@@ -1212,7 +1226,7 @@ def safe_cancel_entry(symbol: str):
 
 def verify_sl_tp(symbol: str):
     try:
-        orders = signed_futures_request("GET", "/fapi/v1/openOrders", {
+        orders = signed_futures_request("GET", "/fapi/v1/openAlgoOrders", {
             "symbol": futures_symbol(symbol)
         })
     except Exception as e:
@@ -1235,12 +1249,10 @@ def verify_sl_tp(symbol: str):
 def attach_sl_tp(symbol, signal, qty, stop_price, tp_price) -> bool:
     try:
         sl_ok, tp_ok = verify_sl_tp(symbol)
-
-        # уже есть на бирже
         if sl_ok and tp_ok:
             return True
 
-        sl, tp = place_sl_tp(
+        place_sl_tp(
             symbol=symbol,
             signal=signal,
             qty=qty,
@@ -1248,14 +1260,13 @@ def attach_sl_tp(symbol, signal, qty, stop_price, tp_price) -> bool:
             tp_price=tp_price
         )
 
-        # финальная проверка (реальная биржа)
         sl_ok, tp_ok = verify_sl_tp(symbol)
-
         return sl_ok and tp_ok
 
     except Exception as e:
         print(f"[{symbol}] SL/TP attach error: {e}")
         return False
+
 
 def cleanup_sl_tp(symbol):
     try:
@@ -1265,7 +1276,6 @@ def cleanup_sl_tp(symbol):
 
     TRADE_STATE["sl_algo_id"] = None
     TRADE_STATE["tp_algo_id"] = None
-
 
 def manage_active_trade():
     try:
@@ -1279,9 +1289,7 @@ def manage_active_trade():
             print(f"[{symbol}] position check error: {e}")
             return
 
-        # =========================
-        # SYNC STATE
-        # =========================
+        # sync with Binance
         if pos_amt > 0:
             TRADE_STATE["position_open"] = True
             TRADE_STATE["locked"] = True
@@ -1289,15 +1297,13 @@ def manage_active_trade():
         if not TRADE_STATE["locked"]:
             return
 
-        # =========================
-        # POSITION OPEN
-        # =========================
+        # 1) position is open
         if pos_amt > 0:
-
-            if TRADE_STATE["sl_algo_id"] is None or TRADE_STATE["tp_algo_id"] is None:
+            # send open message only once
+            if not TRADE_STATE["sl_tp_requested"]:
+                TRADE_STATE["sl_tp_requested"] = True
 
                 safe_cancel_entry(symbol)
-
                 ok = attach_sl_tp(
                     symbol=symbol,
                     signal=TRADE_STATE["signal"],
@@ -1305,17 +1311,16 @@ def manage_active_trade():
                     stop_price=float(exchange.price_to_precision(symbol, TRADE_STATE["stop_price"])),
                     tp_price=float(exchange.price_to_precision(symbol, TRADE_STATE["tp_price"]))
                 )
-
                 if ok:
                     send_telegram_safe(f"✅ {symbol} SL/TP attached")
-
+                else:
+                    print(f"[{symbol}] SL/TP failed once")
             return
+ 
+           
 
-        # =========================
-        # ENTRY CHECK
-        # =========================
+        # 2) entry order still pending
         if TRADE_STATE.get("entry_order_id"):
-
             elapsed = time.time() - TRADE_STATE.get("entry_order_time", time.time())
 
             if elapsed >= ENTRY_TIMEOUT_SEC:
@@ -1341,19 +1346,12 @@ def manage_active_trade():
             except Exception as e:
                 print(f"[{symbol}] entry check error: {e}")
 
-        # =========================
-        # POSITION CLOSED
-        # =========================
+        # 3) position closed
         if pos_amt == 0 and TRADE_STATE["position_open"]:
-
             TRADE_STATE["position_open"] = False
 
-            try:
-                cancel_all_symbol_orders(symbol)
-            except Exception as e:
-                print(f"[{symbol}] cleanup error: {e}")
-
-            send_telegram_safe(f"🧹 {symbol} position closed → cleaned")
+            cleanup_sl_tp(symbol)
+            send_telegram_safe(f"🧹 {symbol} closed → all orders removed")
 
             clear_trade_state()
             return
@@ -1495,6 +1493,8 @@ def run():
                 last_signal[signal_key] = candle_time
                 return  # одна сделка за раз, остальные сигналы игнорируем
 
+# синхронизация времени Binance (ВАЖНО)
+sync_binance_time()
 
 # ================= LOOP =================
 while True:
