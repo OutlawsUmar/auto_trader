@@ -24,11 +24,11 @@ BINANCE_API_SECRET = "cxaVPBF1CI4cS4BezfrGuJiqp8FP5wLCWjucYLqSXlovbszGrhAKN7sC1T
 
 BASE_FUTURES_URL = "https://fapi.binance.com"
 
-LEVERAGE = 3
+LEVERAGE = 33
 BALANCE_USAGE = 0.99          # 99,5% от доступного USDT
 ENTRY_TIMEOUT_SEC = 60 * 60   # 1 час
 RISK_MIN = 0.005
-RISK_MAX = 0.15
+RISK_MAX = 0.04
 TIME_OFFSET_MS = 0
 
 symbols = [
@@ -844,7 +844,7 @@ def get_entry_price(price, atr, signal, strategy_name, last=None):
 
     # TREND
     if "TREND" in name:
-        return price - atr * 0.5 if signal == "BUY" else price + atr * 0.5
+        return price - atr * 0.6 if signal == "BUY" else price + atr * 0.6
 
     # EXPANSION
     elif "EXPANSION" in name:
@@ -853,9 +853,9 @@ def get_entry_price(price, atr, signal, strategy_name, last=None):
             candle_range = last["high"] - last["low"]
 
             if signal == "BUY":
-                return last["high"] - candle_range * 0.5
+                return last["high"] - candle_range * 0.6
             else:
-                return last["low"] + candle_range * 0.5
+                return last["low"] + candle_range * 0.6
 
         return price
 
@@ -1315,6 +1315,7 @@ def manage_active_trade():
                     send_telegram_safe(f"✅ {symbol} SL/TP attached")
                 else:
                     print(f"[{symbol}] SL/TP failed once")
+                    send_telegram_safe(f"✅ {symbol} SL/TP attached")
             return
  
            
